@@ -62,6 +62,7 @@ Apple TV=9MW0ZWQFH0M2
 HBO Max=9PJJ1K9DZMRS
 Plex=9WZDNCRFJ3Q8
 ```
+<img width="922" height="515" alt="grafik" src="https://github.com/user-attachments/assets/8cbb51fa-9539-457f-bbdc-538fdc27af25" />
 
 ## Channels
 
