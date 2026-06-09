@@ -62,8 +62,6 @@ Apple TV=9MW0ZWQFH0M2
 HBO Max=9PJJ1K9DZMRS
 Plex=9WZDNCRFJ3Q8
 ```
-<img width="922" height="515" alt="grafik" src="https://github.com/user-attachments/assets/8cbb51fa-9539-457f-bbdc-538fdc27af25" />
-
 ## Channels
 
 | Channel              | Item type            | Access | Description |
@@ -119,6 +117,9 @@ Send a value to the `launch` channel:
 - a raw **Store product ID** (e.g. `9WZDNCRFJ3TJ`) for any app not in the list.
 
 In the UI the channel offers a drop-down built from `appList`. To add an app, find its Store product ID — it is the last segment of the app's Microsoft Store URL, `https://apps.microsoft.com/detail/<ID>` — and add a `Name=ID` line to `appList`. App launch runs through the Xbox Live cloud, so the console must have remote features enabled and be reachable by the cloud.
+
+Configurate in UI Tab "Things"
+<img width="922" height="515" alt="grafik" src="https://github.com/user-attachments/assets/8cbb51fa-9539-457f-bbdc-538fdc27af25" />
 
 ## Full Example
 
