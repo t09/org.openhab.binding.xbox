@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<thing:thing-descriptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:thing="https://openhab.org/schemas/thing-description/v1.0.0"
+  xsi:schemaLocation="https://openhab.org/schemas/thing-description/v1.0.0 https://openhab.org/schemas/thing-description/v1.0.0"
+  bindingId="xbox">
+
+  <thing-type id="xbox">
+    <label>Xbox Console</label>
+    <description>An Xbox gaming console controlled via SmartGlass and the Xbox Live cloud (remote power, app launch, status, storage).</description>
+
+    <channels>
+      <channel id="power" typeId="power" />
+      <channel id="status" typeId="status" />
+      <channel id="launch" typeId="app-launch" />
+      <channel id="currentTitle" typeId="currentTitle" />
+      <channel id="coverArt" typeId="coverArt" />
+      <channel id="storageFree" typeId="storageFree" />
+      <channel id="storageTotal" typeId="storageTotal" />
+      <channel id="storageUsedPercent" typeId="storageUsedPercent" />
+    </channels>
+
+    <config-description>
+      <parameter name="host" type="text">
+        <label>IP Address / Hostname</label>
+        <description>The IP address or hostname of the Xbox console (leave empty for broadcast).</description>
+      </parameter>
+      <parameter name="authenticationUrl" type="text">
+        <label>Login QR-Code</label>
+        <description>
+          Scan this QR code with your phone to sign in with your Microsoft account.
+          Appears automatically a few seconds after creating the Thing. The code is
+          pre-filled — just confirm the sign-in on your phone.
+        </description>
+        <context>qrcode</context>
+      </parameter>
+      <parameter name="userCode" type="text" readOnly="true">
+        <label>Verification Code</label>
+        <description>If you can't scan: open microsoft.com/link on any device and enter this code. Filled automatically.</description>
+      </parameter>
+      <parameter name="clientId" type="text" required="false">
+        <label>Client ID (optional)</label>
+        <description>
+          Leave empty to use the built-in Xbox app sign-in (recommended — no Azure account needed).
+          Only set this if you want to use your own registered Microsoft/Azure application ID.
+        </description>
+        <advanced>true</advanced>
+      </parameter>
+      <parameter name="refreshToken" type="text">
+        <label>Refresh Token</label>
+        <description>
+          Microsoft OAuth Refresh Token. Wird nach erfolgreichem QR-Login automatisch
+          gefuellt — normalerweise musst du hier nichts eintragen. Danach geht das
+          Thing automatisch ONLINE.
+        </description>
+        <context>password</context>
+        <advanced>true</advanced>
+      </parameter>
+      <parameter name="deviceCode" type="text">
+        <label>Device Code</label>
+        <description>Internal OAuth device code.</description>
+        <advanced>true</advanced>
+      </parameter>
+      <parameter name="pollingInterval" type="integer" unit="s" min="5" required="false">
+        <label>Polling Interval</label>
+        <description>How often (in seconds) the console status is polled. Default 600, minimum 5.</description>
+        <default>600</default>
+        <advanced>true</advanced>
+      </parameter>
+      <parameter name="appList" type="text" required="false" multiple="true">
+        <label>App Launch List</label>
+        <description>
+          The apps shown in the "Launch App" channel, one entry per line as "Name=StoreProductId".
+          Pre-filled with sensible defaults — simply add or remove a line to add/remove an app.
+          The name is shown in the dropdown; the Store Product ID is what gets launched. Find an
+          app's ID in its Microsoft Store link: apps.microsoft.com/detail/&lt;ID&gt;.
+        </description>
+        <default>Netflix=9WZDNCRFJ3TJ,Disney+=9NXQXXLFST89,Prime Video=9P6RC76MSMMJ,Spotify=9NCBCSZSJRSB,Twitch=9PFJP1Q9R4FK,Apple TV=9MW0ZWQFH0M2,HBO Max=9PJJ1K9DZMRS,Plex=9WZDNCRFJ3Q8</default>
+        <advanced>true</advanced>
+      </parameter>
+    </config-description>
+  </thing-type>
+
+  <channel-type id="power">
+    <item-type>Switch</item-type>
+    <label>Power</label>
+    <description>Power state of the Xbox console</description>
+  </channel-type>
+
+  <channel-type id="status">
+    <item-type>String</item-type>
+    <label>Authentication Status</label>
+    <description>Status of the Xbox authentication</description>
+  </channel-type>
+
+  <channel-type id="app-launch">
+    <item-type>String</item-type>
+    <label>Launch App</label>
+    <description>Launch a specific application. The options come from the Thing's "App Launch List"
+      config (pre-filled with defaults; the entries below are only the fallback). Sending a raw
+      Store Product ID as a command also works.</description>
+    <state>
+      <options>
+        <option value="Netflix">Netflix</option>
+        <option value="Disney+">Disney+</option>
+        <option value="Prime Video">Prime Video</option>
+        <option value="Spotify">Spotify</option>
+        <option value="Twitch">Twitch</option>
+        <option value="Apple TV">Apple TV</option>
+        <option value="HBO Max">HBO Max</option>
+        <option value="Plex">Plex</option>
+      </options>
+    </state>
+  </channel-type>
+
+  <channel-type id="currentTitle">
+    <item-type>String</item-type>
+    <label>Current Title</label>
+    <description>The name of the currently running application or game</description>
+  </channel-type>
+
+  <channel-type id="coverArt">
+    <item-type>Image</item-type>
+    <label>Cover Art</label>
+    <description>Cover art of the currently running application or game</description>
+  </channel-type>
+
+  <channel-type id="storageFree">
+    <item-type>Number:DataAmount</item-type>
+    <label>Storage Free</label>
+    <description>Free space on the internal storage of the console</description>
+    <state readOnly="true" pattern="%.1f GiB" />
+  </channel-type>
+
+  <channel-type id="storageTotal">
+    <item-type>Number:DataAmount</item-type>
+    <label>Storage Total</label>
+    <description>Total size of the internal storage of the console</description>
+    <state readOnly="true" pattern="%.1f GiB" />
+  </channel-type>
+
+  <channel-type id="storageUsedPercent">
+    <item-type>Number:Dimensionless</item-type>
+    <label>Storage Used</label>
+    <description>Used storage as a percentage of total capacity</description>
+    <state readOnly="true" pattern="%.0f %%" />
+  </channel-type>
+
+</thing:thing-descriptions>

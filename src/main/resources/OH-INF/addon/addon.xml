@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon:addon xmlns:addon="https://openhab.org/schemas/addon/v1.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="xbox"
+    xsi:schemaLocation="https://openhab.org/schemas/addon/v1.0.0 https://openhab.org/schemas/addon-1.0.0.xsd">
+
+    <type>binding</type>
+
+    <name>Xbox Binding</name>
+    <description>The Xbox binding allows you to control and monitor Xbox consoles on your local network. It supports remote power control (SmartGlass wake + Xbox Live cloud), app launching, presence and storage monitoring.</description>
+    <connection>local</connection>
+
+</addon:addon>
