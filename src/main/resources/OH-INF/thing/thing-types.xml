@@ -19,6 +19,8 @@
       <channel id="storageUsedPercent" typeId="storageUsedPercent" />
     </channels>
 
+    <representation-property>liveId</representation-property>
+
     <config-description>
       <parameter name="host" type="text">
         <label>IP Address / Hostname</label>
@@ -29,7 +31,8 @@
         <description>
           Scan this QR code with your phone to sign in with your Microsoft account.
           Appears automatically a few seconds after creating the Thing. The code is
-          pre-filled — just confirm the sign-in on your phone.
+          pre-filled — just confirm the sign-in on your phone. An expired code is
+          replaced by a new one automatically.
         </description>
         <context>qrcode</context>
       </parameter>
@@ -48,16 +51,12 @@
       <parameter name="refreshToken" type="text">
         <label>Refresh Token</label>
         <description>
-          Microsoft OAuth Refresh Token. Wird nach erfolgreichem QR-Login automatisch
-          gefuellt — normalerweise musst du hier nichts eintragen. Danach geht das
-          Thing automatisch ONLINE.
+          Microsoft OAuth refresh token. Filled automatically after QR sign-in and updated
+          on every token renewal (Microsoft rotates it) — normally you do not need to enter
+          anything here. The Thing then goes ONLINE automatically. If Microsoft rejects the
+          token, a new QR sign-in starts automatically.
         </description>
         <context>password</context>
-        <advanced>true</advanced>
-      </parameter>
-      <parameter name="deviceCode" type="text">
-        <label>Device Code</label>
-        <description>Internal OAuth device code.</description>
         <advanced>true</advanced>
       </parameter>
       <parameter name="pollingInterval" type="integer" unit="s" min="5" required="false">

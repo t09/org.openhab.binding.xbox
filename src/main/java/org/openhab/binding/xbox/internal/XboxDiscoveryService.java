@@ -36,6 +36,7 @@ import org.slf4j.LoggerFactory;
 @Component(service = DiscoveryService.class, immediate = true)
 public class XboxDiscoveryService extends AbstractDiscoveryService {
 
+    @SuppressWarnings("null")
     private final Logger logger = LoggerFactory.getLogger(XboxDiscoveryService.class);
 
     private static final int SMARTGLASS_PORT = 5050;
@@ -85,7 +86,6 @@ public class XboxDiscoveryService extends AbstractDiscoveryService {
         }
     }
 
-    @SuppressWarnings("null")
     private void sendToMulticast() {
         for (String target : new String[]{ "239.255.255.250", "255.255.255.255" }) {
             try (DatagramSocket sock = target.startsWith("239")
@@ -156,24 +156,27 @@ public class XboxDiscoveryService extends AbstractDiscoveryService {
                        + " (" + ip + ")";
 
         // Live ID stammt aus dem X509-Zertifikat der Discovery-Antwort (Subject CN), NICHT
-        // aus der UUID. Sie wird fuer das Power-On-Paket (Fern-Einschalten) benoetigt.
+        // aus der UUID. Sie wird fuer das Power-On-Paket (Fern-Einschalten) benoetigt. Da liveId
+        // kein deklarierter Config-Parameter ist, legt die Inbox sie als Thing-Property ab – der
+        // Handler liest sie dort (XboxHandler#getLiveId).
         @Nullable String liveId = LiveIdUtil.parseLiveId(data, len);
 
         Map<String, Object> props = new HashMap<>();
         props.put(XboxBindingConstants.CONFIG_HOST, ip);
+        DiscoveryResultBuilder builder = DiscoveryResultBuilder.create(new ThingUID(THING_TYPE_XBOX, thingId))
+                .withLabel(label);
         if (liveId != null && !liveId.isEmpty()) {
             props.put(XboxBindingConstants.CONFIG_LIVE_ID, liveId);
+            // Representation-Property: die Inbox erkennt die Konsole an der Live ID wieder (auch bei
+            // manuell angelegten Things, bei denen sie in der Config steht) -> kein Doppel-Thing.
+            builder.withRepresentationProperty(XboxBindingConstants.CONFIG_LIVE_ID);
             logger.info("Resolved Xbox Live ID from certificate: {}", liveId);
         } else {
             logger.debug("Could not parse Live ID from discovery certificate for {}", ip);
         }
         logger.info("Discovered Xbox: {} at {}", label, ip);
 
-        ThingUID thingUID = new ThingUID(THING_TYPE_XBOX, thingId);
-        DiscoveryResult result = DiscoveryResultBuilder.create(thingUID)
-                .withLabel(label)
-                .withProperties(props)
-                .build();
+        DiscoveryResult result = builder.withProperties(props).build();
         thingDiscovered(result);
     }
 

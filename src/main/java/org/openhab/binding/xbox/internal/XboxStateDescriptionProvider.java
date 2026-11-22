@@ -15,7 +15,7 @@ import org.osgi.service.component.annotations.Reference;
  * Auswahlliste des {@code launch}-Channels zur Laufzeit aus der Thing-Config {@code appList},
  * sodass das Dropdown automatisch befüllt und ohne Rebuild änderbar ist.
  *
- * @author Jochen
+ * @author t09
  */
 @Component(service = { DynamicStateDescriptionProvider.class, XboxStateDescriptionProvider.class })
 @NonNullByDefault

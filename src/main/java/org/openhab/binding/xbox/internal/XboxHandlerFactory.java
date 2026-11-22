@@ -15,7 +15,7 @@ import org.osgi.service.component.annotations.Reference;
  * The {@link XboxHandlerFactory} is responsible for creating things and thing
  * handlers.
  *
- * @author Jochen
+ * @author t09
  */
 @NonNullByDefault
 @Component(service = ThingHandlerFactory.class, immediate = true, configurationPid = "binding.xbox")

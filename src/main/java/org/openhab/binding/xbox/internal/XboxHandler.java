@@ -4,18 +4,24 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.SocketTimeoutException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpRequest.BodyPublishers;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
@@ -37,18 +43,21 @@ import org.openhab.core.types.Command;
 import org.openhab.core.types.RefreshType;
 import org.openhab.core.types.State;
 import org.openhab.core.types.StateOption;
+import org.openhab.core.types.UnDefType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 
 /**
  * The {@link XboxHandler} is responsible for handling commands, which are
  * sent to one of the channels.
  *
- * @author Jochen
+ * @author t09
  */
 @NonNullByDefault
 public class XboxHandler extends BaseThingHandler {
@@ -56,14 +65,42 @@ public class XboxHandler extends BaseThingHandler {
     @SuppressWarnings("null")
     private final Logger logger = LoggerFactory.getLogger(XboxHandler.class);
     private @Nullable ScheduledFuture<?> pollingTask;
+    private final Object authLock = new Object();
     private @Nullable ScheduledFuture<?> authPollingTask;
+    // Schuetzt editConfiguration()/updateConfiguration() gegen Lost-Update-Races zwischen
+    // Auth-Callbacks, Token-Rotation und Live-ID-Lernen. Lock-Reihenfolge: tokenLock -> configLock.
+    private final Object configLock = new Object();
+    // Sammel-Poll fuer REFRESH-Bursts (s. requestPoll) und Sperre, damit nie zwei Polls parallel
+    // laufen (Poll-Intervall, REFRESH und Nach-Befehl-Checks koennen zusammentreffen).
+    private final Object pollLock = new Object();
+    private @Nullable ScheduledFuture<?> refreshJob;
+    private final AtomicBoolean pollRunning = new AtomicBoolean();
+    // Kam waehrend eines laufenden Polls eine weitere Anfrage, wird danach ein Poll nachgeholt.
+    private final AtomicBoolean pollAgain = new AtomicBoolean();
+    private static final long REFRESH_DELAY_MS = 2000;
+    // Nach dispose() (Thing geloescht) duerfen noch geplante Tasks/Callbacks nichts mehr aktualisieren.
+    private volatile boolean disposed = false;
     private volatile int consecutiveFailures = 0;
+    // Ohne Timeouts wartet Javas HttpClient unbegrenzt – ein haengender Request blockierte dann einen
+    // Thread des gemeinsamen thingHandler-Pools (5 Threads fuer ALLE Bindings).
+    private static final long HTTP_TIMEOUT_SECONDS = 20;
     @SuppressWarnings("null")
-    private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS)).build();
+    // Token-Zustand, geschuetzt durch tokenLock. Bewusst NICHT der Handler-Monitor: BaseThingHandler
+    // synchronisiert updateState & Co. auf this – ein Refresh mit Netzwerk-I/O wuerde sie blockieren.
+    private final Object tokenLock = new Object();
     private volatile @Nullable String xstsToken;
     private volatile @Nullable String userHash;
     private volatile @Nullable String xuid;
     private volatile long tokenExpiry = 0;
+    private volatile long tokenObtainedAt = 0;
+    // Nach einem fehlgeschlagenen Refresh nicht vor diesem Zeitpunkt erneut versuchen (Backoff).
+    private volatile long tokenRetryAfter = 0;
+    private static final long TOKEN_RETRY_MS = 60_000;
+    // XSTS-Token gelten ~16 h (NotAfter); 5 Min vorher erneuern. Ohne NotAfter: nach 1 h.
+    private static final long TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
+    private static final long TOKEN_FALLBACK_LIFETIME_MS = 3_600_000;
     private volatile @Nullable String currentTitleId;
     // Erwarteter Power-Zustand nach einem Schaltbefehl + Ablaufzeitpunkt der "Grace-Periode".
     // Solange die Konsole den Uebergang (Boot ~Sekunden, Shutdown ~1 Min) noch nicht vollzogen
@@ -73,11 +110,25 @@ public class XboxHandler extends BaseThingHandler {
     private volatile @Nullable Boolean pendingPowerState;
     private volatile long pendingPowerUntil = 0;
     private static final long POWER_GRACE_MS = 90_000;
+    // Das Power-On-Paket geht mehrfach raus (UDP ist verlustbehaftet), zeitversetzt per scheduler
+    // statt Thread.sleep – sonst blockiert handleCommand bzw. ein Pool-Thread.
+    private static final int POWER_ON_REPEATS = 5;
+    private static final long POWER_ON_REPEAT_MS = 500;
     // Session-Cookies (z. B. uaid) aus der device-code-Antwort. login.live.com verlangt, dass
     // sie beim Token-Polling zurueckgeschickt werden, sonst wird der abgeschlossene Login nicht
     // erkannt (Fehler invalid_grant "user must first sign in"). Javas CookieManager macht das
     // bei host==domain nicht zuverlaessig, daher fangen wir die Cookies manuell ab.
     private volatile @Nullable String authCookies;
+    // Laufender Device-Code-Login: der Code steckt nur im Polling-Task (bewusst NICHT mehr in der
+    // Config): er gilt ~15 Min und braucht die Session-Cookies oben – nach einem Neustart waere er tot.
+    private volatile long deviceCodeIssuedAt = 0;
+    // Aktuelles Poll-Intervall des Device-Code-Logins; "slow_down" erhoeht es um 5 s (RFC 8628 §3.5).
+    private volatile int authPollInterval = 5;
+    // Laeuft ein Code schneller ab, wird NICHT automatisch ein neuer angefordert (Schutz vor einer
+    // Endlosschleife, falls Microsoft sofort expired_token liefert).
+    private static final long MIN_DEVICE_CODE_LIFETIME_MS = 60_000;
+    // Hinweis "keine/mehrere Konsolen im Account" nur einmal pro initialize() loggen.
+    private volatile boolean liveIdHintLogged = false;
 
     // Nativer MSA-Scope fuer den login.live.com-Flow mit der Legacy-Client-ID. Liefert
     // automatisch einen refresh_token. WICHTIG: NICHT der Azure-Scope "XboxLive.signin" –
@@ -93,6 +144,7 @@ public class XboxHandler extends BaseThingHandler {
     // Liefert Power-State + aktive App und erlaubt zuverlaessiges Ein-/Ausschalten ueber die
     // Cloud (XSTS-Token), unabhaengig vom lokalen verschluesselten SmartGlass-Handshake.
     private static final String XCCS_URL = "https://xccs.xboxlive.com";
+    @SuppressWarnings("null")
     private final String smartglassSessionId = java.util.UUID.randomUUID().toString();
 
     // Microsoft-Account- (Live-Connect-) Endpunkte fuer den Device-Code-Flow.
@@ -101,6 +153,29 @@ public class XboxHandler extends BaseThingHandler {
     private static final String LIVE_TOKEN_URL = "https://login.live.com/oauth20_token.srf";
 
     private final XboxStateDescriptionProvider stateDescriptionProvider;
+
+    /**
+     * Eintrag der App-Liste: Anzeigename (Dropdown) + Store-Product-ID (oneStoreProductId). Bewusst
+     * kein record: der wuerde java.lang.runtime importieren, das ein Karaf-System-Bundle evtl. nicht
+     * exportiert (vgl. java.net.http in bnd.bnd) – das Bundle liesse sich dann nicht aufloesen.
+     */
+    static final class AppEntry {
+        private final String name;
+        private final String productId;
+
+        AppEntry(String name, String productId) {
+            this.name = name;
+            this.productId = productId;
+        }
+
+        String name() {
+            return name;
+        }
+
+        String productId() {
+            return productId;
+        }
+    }
 
     public XboxHandler(Thing thing, XboxStateDescriptionProvider stateDescriptionProvider) {
         super(thing);
@@ -114,6 +189,7 @@ public class XboxHandler extends BaseThingHandler {
     }
 
     /** URL-encodes a value for an x-www-form-urlencoded body (UTF-8). */
+    @SuppressWarnings("null") // URLEncoder ist nicht null-annotiert, liefert aber nie null
     private static String enc(String value) {
         return java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8);
     }
@@ -122,13 +198,10 @@ public class XboxHandler extends BaseThingHandler {
      * Extracts the cookie name=value pairs from a response's Set-Cookie headers and joins them
      * into a single Cookie header value (e.g. "uaid=...; foo=bar").
      */
+    @SuppressWarnings("null") // java.net.http ist nicht null-annotiert
     private static String extractCookies(HttpResponse<?> response) {
-        java.util.List<String> setCookies = response.headers().allValues("set-cookie");
-        if (setCookies.isEmpty()) {
-            return "";
-        }
         StringBuilder sb = new StringBuilder();
-        for (String sc : setCookies) {
+        for (String sc : response.headers().allValues("set-cookie")) {
             String pair = sc.split(";", 2)[0].trim();
             if (!pair.isEmpty()) {
                 if (sb.length() > 0) {
@@ -143,10 +216,11 @@ public class XboxHandler extends BaseThingHandler {
     @Override
     public void handleCommand(ChannelUID channelUID, Command command) {
         // REFRESH zuerst behandeln, damit es fuer JEDEN Channel (auch power/launch) einen Poll
-        // ausloest – frueher wurde es von den channelUID-Zweigen verschluckt.
+        // ausloest. openHAB schickt REFRESH auch selbst: BaseThingHandler.channelLinked() ruft fuer
+        // jeden verknuepften Channel handleCommand(REFRESH) auf – requestPoll() fasst das zusammen.
         if (command instanceof RefreshType) {
-            logger.debug("REFRESH requested for channel '{}' – triggering poll", channelUID.getId());
-            scheduler.execute(this::checkStatus);
+            logger.debug("REFRESH requested for channel '{}'", channelUID.getId());
+            requestPoll(REFRESH_DELAY_MS);
             return;
         }
         if (channelUID.getId().equals(XboxBindingConstants.CHANNEL_POWER)) {
@@ -156,23 +230,36 @@ public class XboxHandler extends BaseThingHandler {
                 powerOff();
             }
         } else if (channelUID.getId().equals(XboxBindingConstants.CHANNEL_LAUNCH)) {
-            if (command instanceof StringType) {
-                launchApp(command.toString());
+            if (command instanceof StringType app) {
+                launchApp(app.toFullString());
             }
         }
     }
 
     /**
-     * Wird von openHAB aufgerufen, sobald ein Channel mit einem Item verknuepft (also "angelegt")
-     * wird. Frueher gab es keinen Override – neu angelegte Channels bekamen daher erst beim
-     * naechsten Poll-Intervall (Default 600s, und ueberhaupt nur die wenigen vom Poll bedienten) einen Wert.
-     * Jetzt wird jeder verknuepfte Channel im Log vermerkt und sofort ein Poll angestossen.
+     * Plant einen Poll ein und fasst Anfragen zusammen: nach dem Initialisieren kommt fuer JEDEN
+     * verknuepften Channel ein REFRESH – das ergibt hier genau einen Poll statt einem pro Item. Ist
+     * schon ein Poll fruehestens zum gewuenschten Zeitpunkt geplant, passiert nichts; ein spaeter
+     * geplanter (z. B. Token-Retry) wird vorgezogen. dispose() bricht den geplanten Poll ab.
      */
-    @Override
-    public void channelLinked(ChannelUID channelUID) {
-        super.channelLinked(channelUID);
-        logger.info("Channel '{}' linked – triggering immediate poll to populate its state", channelUID.getId());
-        scheduler.execute(this::checkStatus);
+    private void requestPoll(long delayMs) {
+        synchronized (pollLock) {
+            if (disposed) {
+                return;
+            }
+            ScheduledFuture<?> job = refreshJob;
+            if (job != null && !job.isDone()) {
+                long remaining = job.getDelay(TimeUnit.MILLISECONDS);
+                if (remaining > 0 && remaining <= delayMs) {
+                    return; // frueher oder gleichzeitig geplant -> reicht
+                }
+                if (remaining > delayMs) {
+                    job.cancel(false); // spaeter geplant -> vorziehen
+                }
+                // remaining <= 0: laeuft bereits und kann veraltet sein -> zusaetzlich neu planen
+            }
+            refreshJob = scheduler.schedule(this::checkStatus, delayMs, TimeUnit.MILLISECONDS);
+        }
     }
 
     /**
@@ -182,19 +269,44 @@ public class XboxHandler extends BaseThingHandler {
      * welchem Wert jeder Channel gepollt wurde.
      */
     private void updateChannel(String channelId, State state) {
+        if (disposed) {
+            return; // spaeter Callback nach dispose() – sonst Warnung "handler already disposed"
+        }
         logger.debug("Polling channel '{}' -> {}", channelId, state);
         updateState(channelId, state);
     }
 
+    /**
+     * Live ID der Konsole. Quellen in dieser Reihenfolge: Config (intern gelernt bzw. aeltere Things),
+     * sonst die Thing-Property aus der Discovery – die Inbox legt nicht deklarierte Discovery-Werte
+     * als Property ab, NICHT in der Config. Fehlt beides, lernt der Poll sie (lokal oder per Cloud).
+     */
+    private @Nullable String getLiveId() {
+        Object configured = getThing().getConfiguration().get(XboxBindingConstants.CONFIG_LIVE_ID);
+        if (configured instanceof String id && !id.isBlank()) {
+            return id.trim();
+        }
+        String discovered = lookup(getThing().getProperties(), XboxBindingConstants.CONFIG_LIVE_ID);
+        return discovered != null && !discovered.isBlank() ? discovered.trim() : null;
+    }
+
+    /**
+     * Map-Lookup, dessen Ergebnis als nullable typisiert ist. java.util.Map ist nicht null-annotiert;
+     * ein direktes {@code get()} auf {@code Map<String, String>} wuerde der Compiler als @NonNull lesen.
+     */
+    private static @Nullable String lookup(Map<String, ? extends @Nullable String> map, String key) {
+        return map.get(key);
+    }
+
     private void powerOn() {
-        String liveId = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_LIVE_ID);
+        String liveId = getLiveId();
 
         // Eine Xbox wacht NICHT per klassischem WoL-Magic-Packet auf, sondern nur per
         // SmartGlass Power-On-Paket (0xDD02), das die Live ID enthaelt. Voraussetzung: in den
         // Xbox-Energieoptionen "Energiesparmodus" -> "Sofort starten" (Instant-On) aktiv.
-        if (liveId == null || liveId.isBlank()) {
-            logger.warn("Cannot power on Xbox: Live ID not yet known. It is auto-detected while "
-                    + "the console is on – turn it on once so the binding can learn the Live ID.");
+        if (liveId == null) {
+            logger.warn("Cannot power on Xbox: Live ID not yet known. It is learned from discovery, from "
+                    + "the console's local reply or from the Xbox cloud console list.");
             return;
         }
         // Wunschzustand merken, damit der Poll waehrend des Bootens nicht zurueckschnappt.
@@ -213,12 +325,8 @@ public class XboxHandler extends BaseThingHandler {
         // verschluesselten SmartGlass-Connect-Handshake, den dieses Binding nicht aufbaut).
         scheduler.execute(() -> {
             sendCloudPowerCommand("TurnOff");
-            try {
-                Thread.sleep(3000);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-            checkStatus();
+            // Status kurz danach nachziehen – geplant statt Thread.sleep (Pool-Thread bleibt frei).
+            scheduler.schedule(this::checkStatus, 3, TimeUnit.SECONDS);
         });
     }
 
@@ -230,9 +338,9 @@ public class XboxHandler extends BaseThingHandler {
     }
 
     private void launchApp(String appNameOrId) {
-        String liveId = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_LIVE_ID);
-        if (liveId == null || liveId.isEmpty()) {
-            logger.warn("Cannot launch app {}: Live ID not configured.", appNameOrId);
+        String liveId = getLiveId();
+        if (liveId == null) {
+            logger.warn("Cannot launch app {}: Live ID not known yet.", appNameOrId);
             return;
         }
 
@@ -260,45 +368,58 @@ public class XboxHandler extends BaseThingHandler {
      * unveraendert durchgereicht – so laesst sich jede beliebige App per ID starten.
      */
     private String resolveStoreProductId(String appNameOrId) {
-        for (Map.Entry<String, String> e : resolveAppMap().entrySet()) {
-            if (e.getKey().equalsIgnoreCase(appNameOrId)) {
-                return e.getValue();
+        for (AppEntry app : resolveAppList()) {
+            if (app.name().equalsIgnoreCase(appNameOrId)) {
+                return app.productId();
             }
         }
         return appNameOrId; // schon eine Store-Product-ID
     }
 
     /**
-     * Liefert die effektive App-Liste (Name -> Store-Product-ID). Quelle: Thing-Config
-     * {@code appList} (Eintraege "Name=Id", je Zeile bzw. komma-getrennt). Ist nichts konfiguriert,
-     * gelten die eingebauten Defaults aus {@link #buildDefaultApps()}. Reihenfolge bleibt erhalten.
+     * Liefert die effektive App-Liste. Quelle: Thing-Config {@code appList}; ist nichts Verwertbares
+     * konfiguriert, gelten die eingebauten Defaults aus {@link #buildDefaultApps()}.
      */
-    private Map<String, String> resolveAppMap() {
-        Map<String, String> map = new LinkedHashMap<>();
-        Object cfg = getThing().getConfiguration().get(XboxBindingConstants.CONFIG_APP_LIST);
-        List<String> entries = new ArrayList<>();
-        if (cfg instanceof List) {
-            for (Object o : (List<?>) cfg) {
-                if (o != null) {
-                    entries.add(o.toString());
+    private List<AppEntry> resolveAppList() {
+        List<AppEntry> apps = parseAppList(getThing().getConfiguration().get(XboxBindingConstants.CONFIG_APP_LIST));
+        return apps.isEmpty() ? buildDefaultApps() : apps;
+    }
+
+    /**
+     * Parst die Thing-Config {@code appList}: Liste (Formular/YAML) oder Text, Eintraege
+     * "Name=StoreProductId" je Zeile bzw. komma-getrennt. Ungueltige Eintraege werden uebersprungen;
+     * kommt ein Name doppelt vor, gilt die spaetere Zeile. Reihenfolge bleibt erhalten.
+     */
+    static List<AppEntry> parseAppList(@Nullable Object cfg) {
+        List<AppEntry> apps = new ArrayList<>();
+        if (cfg instanceof List<?> list) {
+            for (Object o : list) {
+                if (o instanceof String entry) {
+                    addAppEntry(apps, entry);
                 }
             }
-        } else if (cfg instanceof String && !((String) cfg).isBlank()) {
-            for (String s : ((String) cfg).split("[,\\n]")) {
-                entries.add(s);
+        } else if (cfg instanceof String text) {
+            for (String entry : text.split("[,\\n]")) {
+                addAppEntry(apps, entry);
             }
         }
-        for (String entry : entries) {
-            int eq = entry.indexOf('=');
-            if (eq > 0) {
-                String name = entry.substring(0, eq).trim();
-                String id = entry.substring(eq + 1).trim();
-                if (!name.isEmpty() && !id.isEmpty()) {
-                    map.put(name, id);
-                }
-            }
+        return apps;
+    }
+
+    private static void addAppEntry(List<AppEntry> apps, @Nullable String entry) {
+        if (entry == null) {
+            return;
         }
-        return map.isEmpty() ? buildDefaultApps() : map;
+        int eq = entry.indexOf('=');
+        if (eq <= 0) {
+            return;
+        }
+        String name = entry.substring(0, eq).trim();
+        String id = entry.substring(eq + 1).trim();
+        if (!name.isEmpty() && !id.isEmpty()) {
+            apps.removeIf(app -> app.name().equals(name));
+            apps.add(new AppEntry(name, id));
+        }
     }
 
     /**
@@ -306,17 +427,17 @@ public class XboxHandler extends BaseThingHandler {
      * Per Thing-Config {@code appList} vollstaendig ueberschreibbar (die Defaults sind dort als
      * {@code <default>} vorausgefuellt, daher reicht meist Zeile hinzufuegen/entfernen).
      */
-    private static Map<String, String> buildDefaultApps() {
-        Map<String, String> m = new LinkedHashMap<>();
-        m.put("Netflix", "9WZDNCRFJ3TJ");
-        m.put("Disney+", "9NXQXXLFST89");
-        m.put("Prime Video", "9P6RC76MSMMJ");
-        m.put("Spotify", "9NCBCSZSJRSB");
-        m.put("Twitch", "9PFJP1Q9R4FK");
-        m.put("Apple TV", "9MW0ZWQFH0M2");
-        m.put("HBO Max", "9PJJ1K9DZMRS");
-        m.put("Plex", "9WZDNCRFJ3Q8");
-        return m;
+    private static List<AppEntry> buildDefaultApps() {
+        List<AppEntry> apps = new ArrayList<>();
+        apps.add(new AppEntry("Netflix", "9WZDNCRFJ3TJ"));
+        apps.add(new AppEntry("Disney+", "9NXQXXLFST89"));
+        apps.add(new AppEntry("Prime Video", "9P6RC76MSMMJ"));
+        apps.add(new AppEntry("Spotify", "9NCBCSZSJRSB"));
+        apps.add(new AppEntry("Twitch", "9PFJP1Q9R4FK"));
+        apps.add(new AppEntry("Apple TV", "9MW0ZWQFH0M2"));
+        apps.add(new AppEntry("HBO Max", "9PJJ1K9DZMRS"));
+        apps.add(new AppEntry("Plex", "9WZDNCRFJ3Q8"));
+        return apps;
     }
 
     /**
@@ -327,8 +448,8 @@ public class XboxHandler extends BaseThingHandler {
      */
     private void updateLaunchOptions() {
         List<StateOption> options = new ArrayList<>();
-        for (String name : resolveAppMap().keySet()) {
-            options.add(new StateOption(name, name));
+        for (AppEntry app : resolveAppList()) {
+            options.add(new StateOption(app.name(), app.name()));
         }
         stateDescriptionProvider.setStateOptions(
                 new ChannelUID(getThing().getUID(), XboxBindingConstants.CHANNEL_LAUNCH), options);
@@ -340,10 +461,8 @@ public class XboxHandler extends BaseThingHandler {
      * Store-Product-ID in den Vordergrund (bzw. installiert/startet sie).
      */
     private boolean launchAppViaCloud(String liveId, String productId) {
-        if (System.currentTimeMillis() > tokenExpiry || xstsToken == null) {
-            refreshXstsToken();
-        }
-        if (xstsToken == null) {
+        String auth = xblAuthHeader();
+        if (auth == null) {
             logger.warn("Cannot launch '{}' via cloud: no valid Xbox token.", productId);
             return false;
         }
@@ -364,7 +483,8 @@ public class XboxHandler extends BaseThingHandler {
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(XCCS_URL + "/commands"))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + xstsToken)
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "4")
                     .header("skillplatform", "RemoteManagement")
                     .header("Content-Type", "application/json")
@@ -377,8 +497,14 @@ public class XboxHandler extends BaseThingHandler {
                 logger.info("Xbox cloud app-launch '{}' accepted.", productId);
                 return true;
             }
+            if (resp.statusCode() == 401) {
+                handleUnauthorized("Xbox cloud app-launch");
+            }
             logger.warn("Xbox cloud app-launch '{}' failed (HTTP {}): {}", productId, resp.statusCode(),
                     resp.body());
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return false;
         } catch (Exception e) {
             logger.error("Error launching app '{}' via cloud: {}", productId, e.getMessage());
@@ -388,48 +514,77 @@ public class XboxHandler extends BaseThingHandler {
 
     @Override
     public void initialize() {
+        disposed = false; // dispose()+initialize() laufen bei Config-Aenderungen auf derselben Instanz
+        updateStatus(ThingStatus.UNKNOWN);
+        removeObsoleteConfig();
         updateLaunchOptions();
-        startPolling();
         String refreshToken = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_REFRESH_TOKEN);
-        String deviceCode   = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_DEVICE_CODE);
 
         if (refreshToken != null && !refreshToken.isEmpty()) {
-            updateStatus(ThingStatus.ONLINE);
-            updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authenticated"));
-            // Sofort einen XSTS-Token holen und einmal pollen, damit die Channels nicht erst
-            // nach dem Poll-Intervall (Default 600s, oder gar nicht) Werte bekommen.
-            scheduler.execute(() -> {
-                refreshXstsToken();
-                checkStatus();
-            });
-        } else if (deviceCode != null && !deviceCode.isEmpty()) {
-            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING, "Authentication in progress");
-            updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authentication in progress"));
-            startAuthPolling(deviceCode, 5);
+            // Status bleibt UNKNOWN, bis der erste Poll den XSTS-Token geholt hat (-> ONLINE, oder
+            // OFFLINE mit konkretem Grund). Frueher stand hier sofort ONLINE – auch bei totem Token.
+            updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authenticating"));
         } else {
+            // Kein Token: immer einen FRISCHEN Device-Code holen (s. Feld deviceCodeIssuedAt).
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING, "Authentication required");
             updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authentication required"));
             initiateAuthentication();
+        }
+        // Pollt auch ohne Login: die lokale Probe liefert Power (UDP-Erreichbarkeit) und lernt die Live ID.
+        startPolling();
+    }
+
+    /**
+     * Aendert die Thing-Konfiguration atomar unter {@code configLock}, damit gleichzeitige
+     * Updates (Auth-Callback, Token-Rotation, Live-ID-Lernen) sich nicht ueberschreiben.
+     */
+    private void modifyConfiguration(Consumer<Configuration> mutator) {
+        synchronized (configLock) {
+            if (disposed) {
+                return;
+            }
+            Configuration config = editConfiguration();
+            mutator.accept(config);
+            updateConfiguration(config);
+        }
+    }
+
+    /** Entfernt den frueheren Config-Parameter {@code deviceCode} aus bestehenden Things. */
+    private void removeObsoleteConfig() {
+        synchronized (configLock) {
+            if (!disposed && getThing().getConfiguration().containsKey(XboxBindingConstants.CONFIG_DEVICE_CODE)) {
+                Configuration config = editConfiguration();
+                config.remove(XboxBindingConstants.CONFIG_DEVICE_CODE);
+                updateConfiguration(config);
+            }
         }
     }
 
     @Override
     public void dispose() {
+        disposed = true;
         stopPolling();
-        // Auch den Auth-Polling-Task stoppen (lief frueher beim dispose weiter) und
-        // Token-Zustand verwerfen, damit wiederholtes Anlegen/Loeschen sauber bleibt.
-        if (authPollingTask != null) {
-            authPollingTask.cancel(true);
-            authPollingTask = null;
+        stopAuthPolling(true);
+        synchronized (pollLock) {
+            ScheduledFuture<?> job = refreshJob;
+            if (job != null) {
+                job.cancel(true);
+                refreshJob = null;
+            }
         }
+        // Token-/Login-Zustand verwerfen, damit wiederholtes Anlegen/Loeschen sauber bleibt.
+        // Bewusst ohne tokenLock, damit dispose() nie auf einen laufenden HTTP-Refresh blockiert.
         xstsToken = null;
         userHash = null;
-        authCookies = null;
         tokenExpiry = 0;
-        // httpClient wird bewusst NICHT geschlossen: openHAB ruft bei Config-Updates (und das
-        // Binding triggert via updateConfiguration() oft welche – Live-ID-Autofill, Token speichern)
-        // dispose()+initialize() auf DERSELBEN Handler-Instanz auf. Ein Schliessen des finalen
-        // httpClient wuerde danach jeden Request mit "closed" scheitern lassen.
+        tokenObtainedAt = 0;
+        tokenRetryAfter = 0;
+        authCookies = null;
+        liveIdHintLogged = false;
+        // httpClient wird bewusst NICHT geschlossen: aendert der NUTZER die Config bzw. das Thing,
+        // ruft openHAB dispose()+initialize() auf DERSELBEN Handler-Instanz auf – ein geschlossener
+        // finaler httpClient liesse danach jeden Request mit "closed" scheitern. (Eigene
+        // updateConfiguration()-Aufrufe des Bindings loesen dagegen KEIN dispose/initialize aus.)
         super.dispose();
     }
 
@@ -437,18 +592,19 @@ public class XboxHandler extends BaseThingHandler {
         stopPolling();
         int interval = resolvePollingInterval();
         logger.debug("Starting status polling every {}s", interval);
-        pollingTask = scheduler.scheduleWithFixedDelay(this::checkStatus, 10, interval, TimeUnit.SECONDS);
+        // Erster Poll nach 1 s: holt den Token und liefert sofort Werte (Default-Intervall 600 s).
+        pollingTask = scheduler.scheduleWithFixedDelay(this::checkStatus, 1, interval, TimeUnit.SECONDS);
     }
 
     /** Liest das Poll-Intervall (Sekunden) aus der Konfiguration; Default 600s, Minimum 5s. */
     private int resolvePollingInterval() {
         int interval = 600;
         Object cfg = getThing().getConfiguration().get(XboxBindingConstants.CONFIG_POLLING_INTERVAL);
-        if (cfg instanceof Number) {
-            interval = ((Number) cfg).intValue();
-        } else if (cfg instanceof String && !((String) cfg).isBlank()) {
+        if (cfg instanceof Number number) {
+            interval = number.intValue();
+        } else if (cfg instanceof String text && !text.isBlank()) {
             try {
-                interval = Integer.parseInt(((String) cfg).trim());
+                interval = Integer.parseInt(text.trim());
             } catch (NumberFormatException e) {
                 logger.warn("Invalid pollingInterval '{}', using default 600s", cfg);
             }
@@ -457,17 +613,40 @@ public class XboxHandler extends BaseThingHandler {
     }
 
     private void stopPolling() {
-        if (pollingTask != null) {
-            pollingTask.cancel(true);
+        ScheduledFuture<?> task = pollingTask;
+        if (task != null) {
+            task.cancel(true);
             pollingTask = null;
         }
     }
 
     private void checkStatus() {
+        if (disposed) {
+            return;
+        }
+        // Nie zwei Polls gleichzeitig. Kommt eine Anfrage waehrend eines laufenden Polls, wird sie
+        // gemerkt und danach nachgeholt – NICHT verworfen: der laufende Poll kann veraltet sein (z. B.
+        // vor dem Login gestartet), sonst bliebe das Thing bis zum naechsten Intervall UNKNOWN.
+        if (!pollRunning.compareAndSet(false, true)) {
+            pollAgain.set(true);
+            logger.debug("Status poll already running – polling again afterwards");
+            return;
+        }
+        try {
+            pollStatus();
+        } finally {
+            pollRunning.set(false);
+        }
+        if (pollAgain.getAndSet(false)) {
+            requestPoll(REFRESH_DELAY_MS);
+        }
+    }
+
+    private void pollStatus() {
         // Bevorzugt die Cloud-Status-API (autoritativer Power-State + aktive App). Wenn diese
         // ein Ergebnis liefert, ist der lokale Probe nicht noetig. Faellt sie aus (kein Token,
         // Netzfehler, RemoteManagement aus), wird lokal weitergeprueft.
-        if (updateStatusFromCloud()) {
+        if (updateStatusFromCloud() || Thread.currentThread().isInterrupted()) {
             return;
         }
 
@@ -509,6 +688,8 @@ public class XboxHandler extends BaseThingHandler {
         return true; // noch im Uebergang -> abweichenden Wert unterdruecken
     }
 
+    // ---- Login (Device-Code-Flow gegen login.live.com) ---------------------------------------
+
     private void initiateAuthentication() {
         String clientId = resolveClientId();
         logger.info("Initializing Xbox OAuth Device Flow (login.live.com) with client_id={}", clientId);
@@ -516,48 +697,65 @@ public class XboxHandler extends BaseThingHandler {
             String form = "client_id=" + enc(clientId) + "&scope=" + enc(SCOPE) + "&response_type=device_code";
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(LIVE_DEVICE_CODE_URL))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .POST(BodyPublishers.ofString(form))
                     .build();
 
             httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                     .thenAccept(response -> {
+                        if (disposed) {
+                            return; // Thing inzwischen entfernt
+                        }
                         try {
                             String body = response.body();
                             logger.debug("Device code response ({}): {}", response.statusCode(), body);
                             // Session-Cookies fuer das spaetere Token-Polling merken.
                             authCookies = extractCookies(response);
-                            JsonObject json = JsonParser.parseString(body).getAsJsonObject();
+                            JsonObject json = parseObject(body);
+                            if (json == null) {
+                                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                                        "Unexpected device-code response (HTTP " + response.statusCode() + ")");
+                                scheduleAuthRetry();
+                                return;
+                            }
 
-                            if (json.has("error")) {
-                                String error = json.get("error").getAsString();
-                                String desc  = json.has("error_description")
-                                        ? json.get("error_description").getAsString() : error;
-                                logger.error("Xbox auth device-code request failed: {}", desc);
+                            String error = jsonString(json, "error");
+                            if (error != null) {
+                                String desc = jsonString(json, "error_description");
+                                logger.error("Xbox auth device-code request failed: {}", desc != null ? desc : error);
                                 updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
                                         "Auth failed: " + error);
                                 return;
                             }
 
-                            String userCode       = json.get("user_code").getAsString();
-                            String verificationUri = json.get("verification_uri").getAsString();
-                            String deviceCode     = json.get("device_code").getAsString();
-                            int    interval       = json.get("interval").getAsInt();
+                            String userCode = jsonString(json, "user_code");
+                            String verificationUri = jsonString(json, "verification_uri");
+                            String code = jsonString(json, "device_code");
+                            if (userCode == null || verificationUri == null || code == null) {
+                                logger.error("Incomplete Xbox auth device-code response: {}", body);
+                                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                                        "Incomplete device-code response from Microsoft");
+                                scheduleAuthRetry();
+                                return;
+                            }
+                            double reportedInterval = readNum(json, "interval");
+                            int interval = reportedInterval >= 1 ? (int) reportedInterval : 5;
+                            deviceCodeIssuedAt = System.currentTimeMillis();
 
                             // QR-Inhalt: Verifikations-URL mit vorbefuelltem Code (otc), damit das
                             // Handy nach dem Scannen den Code nicht mehr manuell braucht.
                             String qrUrl = verificationUri + "?otc=" + userCode;
 
-                            Configuration config = editConfiguration();
-                            config.put(XboxBindingConstants.CONFIG_AUTHENTICATION_URL, qrUrl);
-                            config.put(XboxBindingConstants.CONFIG_USER_CODE, userCode);
-                            config.put(XboxBindingConstants.CONFIG_DEVICE_CODE, deviceCode);
-                            updateConfiguration(config);
+                            modifyConfiguration(config -> {
+                                config.put(XboxBindingConstants.CONFIG_AUTHENTICATION_URL, qrUrl);
+                                config.put(XboxBindingConstants.CONFIG_USER_CODE, userCode);
+                            });
 
                             logger.info("Xbox auth: scan QR / go to {} and enter code: {}", verificationUri, userCode);
                             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING,
                                     "Scan QR or go to " + verificationUri + " – Code: " + userCode);
-                            startAuthPolling(deviceCode, interval);
+                            startAuthPolling(code, interval);
                         } catch (Exception e) {
                             logger.error("Error processing auth device-code response: {}", e.getMessage(), e);
                             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
@@ -565,9 +763,13 @@ public class XboxHandler extends BaseThingHandler {
                         }
                     })
                     .exceptionally(e -> {
+                        if (disposed) {
+                            return null;
+                        }
                         logger.error("HTTP request to Microsoft device-code endpoint failed: {}", e.getMessage(), e);
                         updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
                                 "Cannot reach Microsoft auth endpoint: " + e.getMessage());
+                        scheduleAuthRetry();
                         return null;
                     });
         } catch (Exception e) {
@@ -577,22 +779,65 @@ public class XboxHandler extends BaseThingHandler {
         }
     }
 
-    private void startAuthPolling(String deviceCode, int interval) {
-        if (authPollingTask != null) {
-            authPollingTask.cancel(true);
+    /** Startet (bzw. ersetzt) das Device-Code-Polling; darf auch aus dem Poll-Task selbst kommen. */
+    private void startAuthPolling(String code, int interval) {
+        synchronized (authLock) {
+            if (disposed) {
+                return;
+            }
+            stopAuthPolling(false);
+            authPollInterval = interval;
+            authPollingTask = scheduler.scheduleWithFixedDelay(() -> pollAuthToken(code), interval, interval,
+                    TimeUnit.SECONDS);
         }
-        authPollingTask = scheduler.scheduleWithFixedDelay(() -> pollAuthToken(deviceCode), interval, interval,
-                TimeUnit.SECONDS);
     }
 
-    private void pollAuthToken(String deviceCode) {
+    /**
+     * Plant einen erneuten Login-Start nach voruebergehendem Netzfehler ein (z. B. Router noch
+     * nicht bereit beim openHAB-Start). Wird von {@link #dispose()} und {@link #startAuthPolling}
+     * automatisch abgebrochen.
+     */
+    private void scheduleAuthRetry() {
+        synchronized (authLock) {
+            if (disposed) {
+                return;
+            }
+            stopAuthPolling(false);
+            authPollingTask = scheduler.schedule(() -> {
+                if (!disposed) {
+                    String refreshToken = (String) getThing().getConfiguration()
+                            .get(XboxBindingConstants.CONFIG_REFRESH_TOKEN);
+                    if (refreshToken == null || refreshToken.isEmpty()) {
+                        initiateAuthentication();
+                    }
+                }
+            }, TOKEN_RETRY_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Beendet das Device-Code-Polling. Aus dem Poll-Task selbst mit {@code false} aufrufen – mit
+     * {@code true} wuerde sich der laufende Task selbst unterbrechen (interrupt des eigenen Threads).
+     */
+    private void stopAuthPolling(boolean mayInterrupt) {
+        synchronized (authLock) {
+            ScheduledFuture<?> task = authPollingTask;
+            if (task != null) {
+                task.cancel(mayInterrupt);
+                authPollingTask = null;
+            }
+        }
+    }
+
+    private void pollAuthToken(String code) {
         String clientId = resolveClientId();
         try {
             String form = "grant_type=urn:ietf:params:oauth:grant-type:device_code"
-                    + "&client_id=" + enc(clientId) + "&device_code=" + enc(deviceCode);
+                    + "&client_id=" + enc(clientId) + "&device_code=" + enc(code);
             // client_id zusaetzlich als Query-Param – so macht es auch die Referenz-Implementierung.
             HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(LIVE_TOKEN_URL + "?client_id=" + enc(clientId)))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
                     .header("Content-Type", "application/x-www-form-urlencoded");
             // Die in der device-code-Antwort gesetzten Cookies zwingend zuruecksenden.
             String cookies = authCookies;
@@ -603,66 +848,115 @@ public class XboxHandler extends BaseThingHandler {
 
             @SuppressWarnings("null")
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
-
-            if (json.has("error")) {
-                String error = json.get("error").getAsString();
-                // "authorization_pending"/"slow_down" sind normal, solange der Nutzer den Code
-                // noch eingibt -> einfach weiter pollen. Harte Fehler beenden das Polling.
-                if (!"authorization_pending".equals(error) && !"slow_down".equals(error)) {
-                    String desc = json.has("error_description") ? json.get("error_description").getAsString() : error;
-                    if ("authorization_declined".equals(error) || "expired_token".equals(error)
-                            || "invalid_grant".equals(error)) {
-                        logger.error("Xbox auth failed: {}", desc);
-                        if (authPollingTask != null) {
-                            authPollingTask.cancel(true);
-                        }
-                        updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
-                                "Auth failed: " + error);
-                    } else {
-                        logger.warn("Xbox auth poll returned: {}", desc);
-                    }
-                }
+            if (disposed) {
+                return; // Thing waehrend des Requests entfernt
+            }
+            JsonObject json = parseObject(response.body());
+            if (json == null) {
+                logger.debug("Unexpected token poll response (HTTP {}): {}", response.statusCode(), response.body());
                 return;
             }
 
-            if (json.has("access_token")) {
-                String refreshToken = json.get("refresh_token").getAsString();
-                Configuration config = editConfiguration();
+            String error = jsonString(json, "error");
+            if (error != null) {
+                handleDeviceCodeError(code, error, jsonString(json, "error_description"));
+                return;
+            }
+
+            String refreshToken = jsonString(json, "refresh_token");
+            if (refreshToken == null || refreshToken.isEmpty()) {
+                logger.warn("Xbox sign-in response without refresh token (HTTP {}), fields: {}",
+                        response.statusCode(), json.keySet());
+                return;
+            }
+            stopAuthPolling(false);
+            modifyConfiguration(config -> {
                 config.put(XboxBindingConstants.CONFIG_REFRESH_TOKEN, refreshToken);
                 config.put(XboxBindingConstants.CONFIG_AUTHENTICATION_URL, "");
                 config.put(XboxBindingConstants.CONFIG_USER_CODE, "Authenticated!");
-                config.put(XboxBindingConstants.CONFIG_DEVICE_CODE, "");
-                updateConfiguration(config);
-
-                if (authPollingTask != null) {
-                    authPollingTask.cancel(true);
-                }
-                updateStatus(ThingStatus.ONLINE);
-                updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authenticated"));
-                logger.info("Xbox successfully authenticated!");
-                // Direkt XSTS-Token holen und Status pollen, damit Power/Title sofort kommen.
-                scheduler.execute(() -> {
-                    refreshXstsToken();
-                    checkStatus();
-                });
+            });
+            // Neuer Login: alten Token-Zustand und Backoff verwerfen, damit sofort ein XSTS-Token kommt.
+            synchronized (tokenLock) {
+                xstsToken = null;
+                tokenExpiry = 0;
+                tokenObtainedAt = 0;
+                tokenRetryAfter = 0;
             }
+
+            logger.info("Xbox successfully authenticated!");
+            updateStatus(ThingStatus.UNKNOWN);
+            updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authenticated"));
+            // Direkt pollen: holt den XSTS-Token (-> ONLINE) und liefert Power/Title sofort.
+            scheduler.execute(this::checkStatus);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (Exception e) {
             logger.error("Error polling for Xbox token: {}", e.getMessage());
         }
     }
 
-    private void fetchPresence() {
-        if (System.currentTimeMillis() > tokenExpiry || xstsToken == null) {
-            refreshXstsToken();
+    /**
+     * Wertet Fehler beim Device-Code-Polling aus (RFC 8628 + login.live.com-Varianten).
+     * "authorization_pending" = Nutzer noch nicht fertig -> weiter pollen; "slow_down" -> langsamer.
+     */
+    private void handleDeviceCodeError(String code, String error, @Nullable String description) {
+        if ("authorization_pending".equals(error)) {
+            return;
         }
-        if (xstsToken == null) {
+        if ("slow_down".equals(error)) {
+            // RFC 8628 §3.5: Intervall fuer diese und alle weiteren Anfragen um 5 s erhoehen.
+            logger.debug("Xbox auth poll: slow_down – increasing interval to {}s", authPollInterval + 5);
+            startAuthPolling(code, authPollInterval + 5);
+            return;
+        }
+        if ("expired_token".equals(error)) {
+            stopAuthPolling(false);
+            if (System.currentTimeMillis() - deviceCodeIssuedAt > MIN_DEVICE_CODE_LIFETIME_MS) {
+                // Frueher eine Sackgasse: der tote Code blieb in der Config und wurde nach jedem
+                // Neustart erneut gepollt. Jetzt einfach einen neuen Code (= neuen QR) anfordern.
+                logger.info("Xbox sign-in code expired – requesting a new one.");
+                initiateAuthentication();
+            } else {
+                signInFailed(error, description);
+            }
+            return;
+        }
+        if ("authorization_declined".equals(error) || "access_denied".equals(error) || "invalid_grant".equals(error)
+                || "bad_verification_code".equals(error)) {
+            stopAuthPolling(false);
+            signInFailed(error, description);
+            return;
+        }
+        logger.warn("Xbox auth poll returned: {}", description != null ? description : error);
+    }
+
+    /** Login endgueltig gescheitert: QR/Code entfernen und am Thing sagen, wie es weitergeht. */
+    private void signInFailed(String error, @Nullable String description) {
+        logger.warn("Xbox sign-in failed: {}", description != null ? description : error);
+        if (disposed) {
+            return;
+        }
+        modifyConfiguration(config -> {
+            config.put(XboxBindingConstants.CONFIG_AUTHENTICATION_URL, "");
+            config.put(XboxBindingConstants.CONFIG_USER_CODE, "");
+        });
+        updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
+                "Sign-in failed (" + error + ") – disable and re-enable the Thing to start a new sign-in");
+        updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Sign-in failed: " + error));
+    }
+
+    // ---- Presence / aktueller Titel ------------------------------------------------------------
+
+    private void fetchPresence() {
+        String auth = xblAuthHeader();
+        if (auth == null) {
             return;
         }
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create("https://userpresence.xboxlive.com/users/me?level=all"))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + xstsToken)
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "3")
                     .header("Accept", "application/json")
                     .header("Accept-Language", "en-US")
@@ -670,8 +964,23 @@ public class XboxHandler extends BaseThingHandler {
                     .build();
 
             httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .thenApply(HttpResponse::body)
-                    .thenAccept(this::applyPresence);
+                    .thenAccept(response -> {
+                        if (disposed) {
+                            return;
+                        }
+                        String body = response.body();
+                        if (response.statusCode() == 200 && body != null) {
+                            applyPresence(body);
+                        } else if (response.statusCode() == 401) {
+                            handleUnauthorized("Presence");
+                        } else {
+                            logger.debug("Presence HTTP {}: {}", response.statusCode(), body);
+                        }
+                    })
+                    .exceptionally(e -> {
+                        logger.debug("Error fetching Xbox presence: {}", e.getMessage());
+                        return null;
+                    });
         } catch (Exception e) {
             logger.error("Error fetching Xbox presence: {}", e.getMessage());
         }
@@ -684,61 +993,57 @@ public class XboxHandler extends BaseThingHandler {
      * Vordergrund-Titel (placement full/fill); "snapped" ist nur die angedockte Neben-App.
      */
     private void applyPresence(String body) {
-        try {
-            JsonObject json = JsonParser.parseString(body).getAsJsonObject();
-            String foregroundName = null;
-            String foregroundId = null;
-            String anyActiveName = null;
-            String anyActiveId = null;
-            if (json.has("devices") && json.get("devices").isJsonArray()) {
-                JsonArray devices = json.getAsJsonArray("devices");
-                outer: for (int d = 0; d < devices.size(); d++) {
-                    JsonObject dev = devices.get(d).getAsJsonObject();
-                    if (!dev.has("titles") || !dev.get("titles").isJsonArray()) {
+        JsonObject json = parseObject(body);
+        JsonArray devices = json != null ? jsonArray(json, "devices") : null;
+        String foregroundName = null;
+        String foregroundId = null;
+        String anyActiveName = null;
+        String anyActiveId = null;
+        if (devices != null) {
+            outer: for (JsonElement deviceElement : devices) {
+                JsonObject dev = asObject(deviceElement);
+                JsonArray titles = dev != null ? jsonArray(dev, "titles") : null;
+                if (titles == null) {
+                    continue;
+                }
+                for (JsonElement titleElement : titles) {
+                    JsonObject title = asObject(titleElement);
+                    if (title == null || !"active".equalsIgnoreCase(jsonString(title, "state"))) {
                         continue;
                     }
-                    JsonArray titles = dev.getAsJsonArray("titles");
-                    for (int t = 0; t < titles.size(); t++) {
-                        JsonObject title = titles.get(t).getAsJsonObject();
-                        String state = title.has("state") ? title.get("state").getAsString() : "";
-                        if (!"active".equalsIgnoreCase(state)) {
-                            continue;
-                        }
-                        String name = title.has("name") ? title.get("name").getAsString() : "";
-                        if (name.isEmpty()) {
-                            continue;
-                        }
-                        String id = title.has("id") ? title.get("id").getAsString() : "";
-                        String placement = title.has("placement") ? title.get("placement").getAsString() : "";
-                        if ("full".equalsIgnoreCase(placement) || "fill".equalsIgnoreCase(placement)) {
-                            foregroundName = name;
-                            foregroundId = id;
-                            break outer; // aktiver Vordergrund-Titel -> fertig
-                        }
-                        if (anyActiveName == null) {
-                            anyActiveName = name;
-                            anyActiveId = id;
-                        }
+                    String name = jsonString(title, "name");
+                    if (name == null || name.isEmpty()) {
+                        continue;
+                    }
+                    String id = jsonString(title, "id");
+                    String placement = jsonString(title, "placement");
+                    if ("full".equalsIgnoreCase(placement) || "fill".equalsIgnoreCase(placement)) {
+                        foregroundName = name;
+                        foregroundId = id;
+                        break outer; // aktiver Vordergrund-Titel -> fertig
+                    }
+                    if (anyActiveName == null) {
+                        anyActiveName = name;
+                        anyActiveId = id;
                     }
                 }
             }
-            String name = foregroundName != null ? foregroundName : anyActiveName;
-            String id = foregroundId != null ? foregroundId : anyActiveId;
-            if (name != null) {
-                updateChannel(XboxBindingConstants.CHANNEL_CURRENT_TITLE, new StringType(name));
-                if (id != null && !id.equals(currentTitleId)) {
-                    currentTitleId = id;
-                    fetchCoverArt(id);
-                }
-            } else {
-                // kein aktiver Titel -> Dashboard
-                updateChannel(XboxBindingConstants.CHANNEL_CURRENT_TITLE, new StringType("Home / Dashboard"));
-                currentTitleId = "0";
+        }
+        String name = foregroundName != null ? foregroundName : anyActiveName;
+        String id = foregroundId != null ? foregroundId : anyActiveId;
+        if (name != null) {
+            updateChannel(XboxBindingConstants.CHANNEL_CURRENT_TITLE, new StringType(name));
+            if (id != null && !id.equals(currentTitleId)) {
+                fetchCoverArt(id);
             }
-        } catch (Exception e) {
-            logger.error("Error parsing Xbox presence: {}", e.getMessage());
+        } else {
+            // kein aktiver Titel -> Dashboard
+            updateChannel(XboxBindingConstants.CHANNEL_CURRENT_TITLE, new StringType("Home / Dashboard"));
+            currentTitleId = "0";
         }
     }
+
+    // ---- Konsolen-Status (Cloud) ---------------------------------------------------------------
 
     /**
      * Holt Power-State + aktive App ueber die Cloud-API (xccs.xboxlive.com/consoles/{liveId}).
@@ -747,20 +1052,24 @@ public class XboxHandler extends BaseThingHandler {
      *         gesetzt); false, wenn nicht (Token fehlt, Live ID fehlt, Netz-/API-Fehler).
      */
     private boolean updateStatusFromCloud() {
-        String liveId = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_LIVE_ID);
-        if (liveId == null || liveId.isBlank()) {
+        String auth = xblAuthHeader();
+        if (auth == null) {
             return false;
         }
-        if (System.currentTimeMillis() > tokenExpiry || xstsToken == null) {
-            refreshXstsToken();
-        }
-        if (xstsToken == null) {
-            return false;
+        String liveId = getLiveId();
+        if (liveId == null) {
+            // Live ID unbekannt (manuell angelegtes Thing; openHAB sieht die Konsole lokal nicht,
+            // z. B. Docker-Bridge oder anderes VLAN): aus der Cloud-Konsolenliste des Accounts lernen.
+            liveId = learnLiveIdFromCloud(auth);
+            if (liveId == null) {
+                return false;
+            }
         }
         try {
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(XCCS_URL + "/consoles/" + liveId))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + xstsToken)
+                    .uri(java.net.URI.create(XCCS_URL + "/consoles/" + enc(liveId)))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "4")
                     .header("skillplatform", "RemoteManagement")
                     .GET()
@@ -768,17 +1077,20 @@ public class XboxHandler extends BaseThingHandler {
 
             @SuppressWarnings("null")
             HttpResponse<String> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
+            if (resp.statusCode() == 401) {
+                handleUnauthorized("Cloud console status");
+                return false;
+            }
+            JsonObject json = resp.statusCode() == 200 ? parseObject(resp.body()) : null;
+            if (json == null) {
                 logger.debug("Cloud console status HTTP {}: {}", resp.statusCode(), resp.body());
                 return false;
             }
-            // Kompletten Body loggen, damit die echte JSON-Struktur (insb. storageDevices und deren
-            // Feldnamen) nachvollziehbar ist, falls Storage-Channels NULL bleiben.
+            // Kompletten Body loggen, damit die echte JSON-Struktur nachvollziehbar ist.
             logger.debug("Cloud console status raw body: {}", resp.body());
-            JsonObject json = JsonParser.parseString(resp.body()).getAsJsonObject();
             // Konsolen-Infos (Name, Modell, Region, ...) als Thing-Properties in die UI uebernehmen.
             updateConsoleProperties(json);
-            String powerState = json.has("powerState") ? json.get("powerState").getAsString() : "Unknown";
+            String powerState = jsonString(json, "powerState");
             boolean on = "On".equalsIgnoreCase(powerState);
 
             if (isPowerSuppressed(on)) {
@@ -800,18 +1112,95 @@ public class XboxHandler extends BaseThingHandler {
             // Speicher kommt NICHT aus /consoles/{id} (Body enthaelt keine storageDevices),
             // sondern aus dem separaten /lists/devices-Endpunkt. Dafuer die echte Konsolen-ID
             // aus der Statusantwort verwenden (kann von der konfigurierten Live ID abweichen).
-            String consoleId = json.has("id") ? json.get("id").getAsString() : liveId;
+            String consoleId = jsonString(json, "id");
             // Speicher immer versuchen: /lists/devices ist ein Cloud-Cache und liefert die zuletzt
             // gemeldeten Speicherwerte oft auch im ConnectedStandby, nicht nur bei powerState=On.
-            fetchStorageDevices(consoleId);
+            fetchStorageDevices(consoleId != null ? consoleId : liveId, auth);
             consecutiveFailures = 0;
-            logger.debug("Cloud status: powerState={}, focusApp={}", powerState,
-                    json.has("focusAppAumid") ? json.get("focusAppAumid").getAsString() : "");
+            logger.debug("Cloud status: powerState={}, focusApp={}", powerState, jsonString(json, "focusAppAumid"));
             return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         } catch (Exception e) {
             logger.debug("Cloud console status failed, falling back to local probe: {}", e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Lernt die Live ID aus der Konsolenliste des Accounts ({@code /lists/devices}). Nur eindeutig:
+     * bei genau einer Konsole wird sie uebernommen, bei mehreren wird NICHT geraten (Hinweis im Log).
+     */
+    private @Nullable String learnLiveIdFromCloud(String auth) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(
+                            XCCS_URL + "/lists/devices?queryCurrentDevice=false&includeStorageDevices=false"))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
+                    .header("x-xbl-contract-version", "4")
+                    .header("skillplatform", "RemoteManagement")
+                    .GET()
+                    .build();
+
+            @SuppressWarnings("null")
+            HttpResponse<String> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 401) {
+                handleUnauthorized("Console list");
+                return null;
+            }
+            JsonObject json = resp.statusCode() == 200 ? parseObject(resp.body()) : null;
+            JsonArray consoles = json != null ? jsonArray(json, "result") : null;
+            if (consoles == null) {
+                logger.debug("Console list HTTP {}: {}", resp.statusCode(), resp.body());
+                return null;
+            }
+            String onlyId = null;
+            int count = 0;
+            StringBuilder found = new StringBuilder();
+            for (JsonElement element : consoles) {
+                JsonObject console = asObject(element);
+                String id = console != null ? jsonString(console, "id") : null;
+                if (console == null || id == null || id.isBlank()) {
+                    continue;
+                }
+                count++;
+                onlyId = id;
+                String name = jsonString(console, "name");
+                if (found.length() > 0) {
+                    found.append(", ");
+                }
+                found.append(name != null ? name : "?").append(" = ").append(id);
+            }
+            if (count == 1 && onlyId != null) {
+                storeLiveId(onlyId, "the Xbox cloud console list");
+                return onlyId;
+            }
+            if (!liveIdHintLogged) {
+                liveIdHintLogged = true;
+                if (count == 0) {
+                    logger.warn("No console found in this Xbox account's device list – is 'Remote features' "
+                            + "enabled on the console?");
+                } else {
+                    logger.warn("The Xbox account has {} consoles ({}). Set 'liveId: <id>' in the Thing "
+                            + "configuration (Code tab) to pick one.", count, found);
+                }
+            }
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (Exception e) {
+            logger.debug("Could not fetch the console list: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** Speichert eine gelernte Live ID in der Config (interner Wert, kein Formularfeld). */
+    private void storeLiveId(String liveId, String source) {
+        modifyConfiguration(config -> config.put(XboxBindingConstants.CONFIG_LIVE_ID, liveId));
+        logger.info("Learned Xbox Live ID {} from {}", liveId, source);
     }
 
     /**
@@ -820,6 +1209,9 @@ public class XboxHandler extends BaseThingHandler {
      * (z. B. Konsolenname, Modell, Region, Streaming-/Remote-Management-Status).
      */
     private void updateConsoleProperties(JsonObject json) {
+        if (disposed) {
+            return;
+        }
         try {
             Map<String, String> props = editProperties();
             putProp(props, json, "id", "Console ID");
@@ -839,10 +1231,13 @@ public class XboxHandler extends BaseThingHandler {
 
     /** Setzt eine Property aus einem JSON-Feld, sofern vorhanden und nicht null. */
     private void putProp(Map<String, String> props, JsonObject json, String field, String label) {
-        if (json.has(field) && !json.get(field).isJsonNull()) {
-            props.put(label, json.get(field).getAsString());
+        String value = jsonString(json, field);
+        if (value != null) {
+            props.put(label, value);
         }
     }
+
+    // ---- Speicher ------------------------------------------------------------------------------
 
     /**
      * Holt die internen Speicher-Geraete der Konsole. Strategie (in dieser Reihenfolge):
@@ -858,14 +1253,11 @@ public class XboxHandler extends BaseThingHandler {
      *     interpretiert) – daher steht die deviceId jetzt im Pfad.</li>
      * </ol>
      */
-    private void fetchStorageDevices(String consoleId) {
-        if (xstsToken == null) {
+    private void fetchStorageDevices(String consoleId, String auth) {
+        if (fetchStorageFromDeviceList(consoleId, auth)) {
             return;
         }
-        if (fetchStorageFromDeviceList(consoleId)) {
-            return;
-        }
-        fetchStorageFromStorageEndpoint(consoleId);
+        fetchStorageFromStorageEndpoint(consoleId, auth);
     }
 
     /**
@@ -875,12 +1267,13 @@ public class XboxHandler extends BaseThingHandler {
      *
      * @return true, wenn Speicherwerte gesetzt werden konnten.
      */
-    private boolean fetchStorageFromDeviceList(String consoleId) {
+    private boolean fetchStorageFromDeviceList(String consoleId, String auth) {
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(
                             XCCS_URL + "/lists/devices?queryCurrentDevice=false&includeStorageDevices=true"))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + xstsToken)
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "4")
                     .header("skillplatform", "RemoteManagement")
                     .GET()
@@ -888,45 +1281,48 @@ public class XboxHandler extends BaseThingHandler {
 
             @SuppressWarnings("null")
             HttpResponse<String> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
+            if (resp.statusCode() == 401) {
+                handleUnauthorized("Device list");
+                return true; // kein Fallback mit demselben ungueltigen Token
+            }
+            JsonObject json = resp.statusCode() == 200 ? parseObject(resp.body()) : null;
+            if (json == null) {
                 logger.debug("Device list HTTP {}: {}", resp.statusCode(), resp.body());
                 return false;
             }
             logger.debug("Device list raw body: {}", resp.body());
-            JsonObject json = JsonParser.parseString(resp.body()).getAsJsonObject();
-            JsonArray devices = null;
-            if (json.has("result") && json.get("result").isJsonArray()) {
-                devices = json.getAsJsonArray("result");
-            } else if (json.has("devices") && json.get("devices").isJsonArray()) {
-                devices = json.getAsJsonArray("devices");
+            JsonArray devices = jsonArray(json, "result");
+            if (devices == null) {
+                devices = jsonArray(json, "devices");
             }
             if (devices == null) {
                 logger.debug("Device list response has no console array. Keys: {}", json.keySet());
                 return false;
             }
             JsonObject chosen = null;
-            for (int i = 0; i < devices.size(); i++) {
-                JsonObject dev = devices.get(i).getAsJsonObject();
+            for (JsonElement element : devices) {
+                JsonObject dev = asObject(element);
+                if (dev == null) {
+                    continue;
+                }
                 if (chosen == null) {
                     chosen = dev; // erste Konsole als Fallback
                 }
-                String id = dev.has("id") && !dev.get("id").isJsonNull() ? dev.get("id").getAsString() : "";
-                if (consoleId.equalsIgnoreCase(id)) {
+                if (consoleId.equalsIgnoreCase(jsonString(dev, "id"))) {
                     chosen = dev; // exakte Konsole gefunden
                     break;
                 }
             }
-            if (chosen == null || !chosen.has("storageDevices") || !chosen.get("storageDevices").isJsonArray()) {
+            JsonArray storage = chosen != null ? jsonArray(chosen, "storageDevices") : null;
+            if (storage == null || storage.size() == 0) {
                 logger.debug("Device list has no storageDevices for console {}.", consoleId);
-                return false;
-            }
-            JsonArray storage = chosen.getAsJsonArray("storageDevices");
-            if (storage.size() == 0) {
-                logger.debug("Device list storageDevices array empty for console {}.", consoleId);
                 return false;
             }
             updateStorage(storage);
             return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         } catch (Exception e) {
             logger.debug("Could not fetch storage via device list: {}", e.getMessage());
             return false;
@@ -936,11 +1332,12 @@ public class XboxHandler extends BaseThingHandler {
     /**
      * Fallback: dedizierter Speicher-Endpunkt mit deviceId im PFAD (nicht als Query-Param).
      */
-    private void fetchStorageFromStorageEndpoint(String consoleId) {
+    private void fetchStorageFromStorageEndpoint(String consoleId, String auth) {
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(XCCS_URL + "/lists/storageDevices/" + enc(consoleId)))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + xstsToken)
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "4")
                     .header("skillplatform", "RemoteManagement")
                     .GET()
@@ -948,17 +1345,24 @@ public class XboxHandler extends BaseThingHandler {
 
             @SuppressWarnings("null")
             HttpResponse<String> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
+            if (resp.statusCode() == 401) {
+                handleUnauthorized("Storage devices");
+                return;
+            }
+            JsonObject json = resp.statusCode() == 200 ? parseObject(resp.body()) : null;
+            if (json == null) {
                 logger.debug("Storage devices HTTP {}: {}", resp.statusCode(), resp.body());
                 return;
             }
             logger.debug("Storage devices raw body: {}", resp.body());
-            JsonObject json = JsonParser.parseString(resp.body()).getAsJsonObject();
-            if (!json.has("result") || !json.get("result").isJsonArray()) {
+            JsonArray result = jsonArray(json, "result");
+            if (result == null) {
                 logger.debug("Storage devices response has no 'result' array. Keys: {}", json.keySet());
                 return;
             }
-            updateStorage(json.getAsJsonArray("result"));
+            updateStorage(result);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (Exception e) {
             logger.debug("Could not fetch storage devices: {}", e.getMessage());
         }
@@ -969,25 +1373,32 @@ public class XboxHandler extends BaseThingHandler {
      * <ul>
      * <li><b>Aggregat-Channels</b> {@code storageFree/storageTotal/storageUsedPercent}: das interne
      *     Standard-Laufwerk (isDefault) bzw. das erste verfuegbare – bleibt fuer bestehende Items.</li>
-     * <li><b>Pro Laufwerk</b>: fuer JEDES erkannte Laufwerk werden dynamisch drei Channels
-     *     {@code storageTotalDrive{n}/storageFreeDrive{n}/storageUsedDrive{n}} angelegt und gesetzt.
-     *     Der Laufwerksname steht im Channel-Label (taucht so im Item-Vorschlag der UI auf).</li>
+     * <li><b>Pro Laufwerk</b>: je Laufwerk drei Channels
+     *     {@code storageTotalDrive{n}/storageFreeDrive{n}/storageUsedDrive{n}} (s.
+     *     {@link #syncDynamicStorageChannels}). Abgesteckte Laufwerke behalten ihre Channels, die
+     *     Werte werden UNDEF – so verwaisen keine Item-Links.</li>
      * </ul>
      */
     private void updateStorage(JsonArray devices) {
         try {
-            if (devices.size() == 0) {
+            List<JsonObject> drives = new ArrayList<>();
+            for (JsonElement element : devices) {
+                JsonObject dev = asObject(element);
+                if (dev != null) {
+                    drives.add(dev);
+                }
+            }
+            if (drives.isEmpty()) {
                 logger.debug("Storage devices list empty (console off or no data yet).");
                 return;
             }
             // 1) Aggregat-Channels: Standard-/Default-Laufwerk (oder erstes verfuegbare).
             JsonObject chosen = null;
-            for (int i = 0; i < devices.size(); i++) {
-                JsonObject dev = devices.get(i).getAsJsonObject();
+            for (JsonObject dev : drives) {
                 if (chosen == null) {
                     chosen = dev;
                 }
-                if (dev.has("isDefault") && dev.get("isDefault").getAsBoolean()) {
+                if ("true".equalsIgnoreCase(jsonString(dev, "isDefault"))) {
                     chosen = dev;
                     break;
                 }
@@ -998,13 +1409,24 @@ public class XboxHandler extends BaseThingHandler {
                         XboxBindingConstants.CHANNEL_STORAGE_FREE, XboxBindingConstants.CHANNEL_STORAGE_USED);
             }
             // 2) Pro Laufwerk eigene Channels (Total/Free/Used%) anlegen/aktualisieren.
-            syncDynamicStorageChannels(devices);
-            for (int i = 0; i < devices.size(); i++) {
-                int n = i + 1;
-                applyStorageValues(devices.get(i).getAsJsonObject(),
-                        XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE + n,
+            int[] slots = syncDynamicStorageChannels(drives);
+            Set<Integer> present = new HashSet<>();
+            int index = 0;
+            for (JsonObject dev : drives) {
+                int n = slots[index++];
+                present.add(n);
+                applyStorageValues(dev, XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE + n,
                         XboxBindingConstants.CHANNEL_STORAGE_FREE_DRIVE + n,
                         XboxBindingConstants.CHANNEL_STORAGE_USED_DRIVE + n);
+            }
+            // 3) Bekannte, aber gerade fehlende Laufwerke (z. B. SSD abgesteckt): Werte UNDEF.
+            for (Channel ch : getThing().getChannels()) {
+                int n = driveNumber(ch.getUID().getId(), XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE);
+                if (n > 0 && !present.contains(n)) {
+                    updateChannel(XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE + n, UnDefType.UNDEF);
+                    updateChannel(XboxBindingConstants.CHANNEL_STORAGE_FREE_DRIVE + n, UnDefType.UNDEF);
+                    updateChannel(XboxBindingConstants.CHANNEL_STORAGE_USED_DRIVE + n, UnDefType.UNDEF);
+                }
             }
         } catch (Exception e) {
             logger.debug("Could not parse storage devices: {}", e.getMessage());
@@ -1033,76 +1455,151 @@ public class XboxHandler extends BaseThingHandler {
         }
     }
 
-    /** True, wenn die Channel-ID zu einem dynamisch pro Laufwerk angelegten Channel gehoert. */
-    private boolean isDynamicStorageChannel(String id) {
-        return id.startsWith(XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE)
-                || id.startsWith(XboxBindingConstants.CHANNEL_STORAGE_FREE_DRIVE)
-                || id.startsWith(XboxBindingConstants.CHANNEL_STORAGE_USED_DRIVE);
+    /**
+     * Legt je Laufwerk drei Channels (Total/Free/Used%) an. Die Nummer n ist STABIL an die
+     * storageDeviceId gebunden (Channel-Property {@code storageDeviceId}): ein Reihenfolge-Wechsel
+     * in der API vertauscht keine Werte, ein abgestecktes Laufwerk behaelt seine Nummer und Channels.
+     * Umgebaut wird nur, wenn ein Laufwerk neu ist bzw. Zuordnung oder Name nicht passen – sonst
+     * kein {@code updateThing} (keine UI-Churn, Item-Links bleiben). Der Laufwerksname kommt ins
+     * Channel-Label, damit er im Item-Vorschlag der UI sichtbar ist.
+     *
+     * @return Laufwerksnummer je Eintrag von {@code drives} (gleiche Reihenfolge)
+     */
+    private int[] syncDynamicStorageChannels(List<JsonObject> drives) {
+        // Ist-Zustand aus den Total-Channels: Nummer -> storageDeviceId (null = Alt-Channel ohne
+        // Property, vor dieser Version angelegt) bzw. Nummer -> Label.
+        Map<Integer, @Nullable String> existingKeys = new HashMap<>();
+        Map<Integer, @Nullable String> existingLabels = new HashMap<>();
+        for (Channel ch : getThing().getChannels()) {
+            int n = driveNumber(ch.getUID().getId(), XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE);
+            if (n > 0) {
+                existingKeys.put(n, lookup(ch.getProperties(), XboxBindingConstants.PROPERTY_STORAGE_DEVICE_ID));
+                existingLabels.put(n, ch.getLabel());
+            }
+        }
+        List<String> keys = new ArrayList<>();
+        int index = 0;
+        for (JsonObject dev : drives) {
+            keys.add(storageDeviceKey(dev, index++));
+        }
+        int[] slots = assignDriveSlots(existingKeys, keys);
+
+        boolean rebuild = false;
+        index = 0;
+        for (JsonObject dev : drives) {
+            int n = slots[index];
+            String key = storageDeviceKey(dev, index++);
+            if (!key.equals(existingKeys.get(n)) || !(driveName(dev, n) + " Total").equals(existingLabels.get(n))) {
+                rebuild = true;
+            }
+        }
+        if (!rebuild || disposed) {
+            return slots; // nichts zu tun
+        }
+        logger.info("Storage drives changed ({} present) – updating per-drive channels.", drives.size());
+        ThingBuilder builder = editThing();
+        index = 0;
+        for (JsonObject dev : drives) {
+            int n = slots[index];
+            String key = storageDeviceKey(dev, index++);
+            String name = driveName(dev, n);
+            addDriveChannel(builder, XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE + n,
+                    XboxBindingConstants.CHANNEL_STORAGE_TOTAL, "Number:DataAmount", name + " Total", key);
+            addDriveChannel(builder, XboxBindingConstants.CHANNEL_STORAGE_FREE_DRIVE + n,
+                    XboxBindingConstants.CHANNEL_STORAGE_FREE, "Number:DataAmount", name + " Free", key);
+            addDriveChannel(builder, XboxBindingConstants.CHANNEL_STORAGE_USED_DRIVE + n,
+                    XboxBindingConstants.CHANNEL_STORAGE_USED, "Number:Dimensionless", name + " Used", key);
+        }
+        if (!disposed) {
+            updateThing(builder.build());
+        }
+        return slots;
     }
 
     /**
-     * Legt fuer jedes erkannte Laufwerk drei Channels (Total/Free/Used%) an bzw. entfernt sie wieder.
-     * Es wird NUR umgebaut, wenn sich die Menge der gewuenschten Laufwerks-Channels geaendert hat
-     * (z. B. externe SSD an-/abgesteckt) – sonst kein {@code updateThing} (keine UI-Churn, Item-Links
-     * bleiben erhalten). Der Laufwerksname kommt ins Channel-Label, damit er im Item-Vorschlag
-     * sichtbar ist; der Live-Name selbst wird nicht als eigener Channel gefuehrt.
+     * Ordnet Laufwerke stabilen Nummern zu. Regeln: (a) bekannte storageDeviceId behaelt ihre Nummer;
+     * (b) Alt-Channels ohne storageDeviceId werden per Position uebernommen (Laufwerk i -> i+1, wie
+     * bisher – bestehende Item-Links passen weiter); (c) neue Laufwerke bekommen die kleinste freie
+     * Nummer. Nummern fehlender Laufwerke bleiben reserviert (deren Channels zeigen UNDEF).
+     *
+     * @param existing vorhandene Nummer -> storageDeviceId (null = Alt-Channel ohne Property)
+     * @param deviceKeys Kennungen der aktuell gemeldeten Laufwerke in API-Reihenfolge
+     * @return Nummer je Eintrag von {@code deviceKeys}
      */
-    private synchronized void syncDynamicStorageChannels(JsonArray devices) {
-        int count = devices.size();
-        Set<String> desired = new LinkedHashSet<>();
-        for (int i = 1; i <= count; i++) {
-            desired.add(XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE + i);
-            desired.add(XboxBindingConstants.CHANNEL_STORAGE_FREE_DRIVE + i);
-            desired.add(XboxBindingConstants.CHANNEL_STORAGE_USED_DRIVE + i);
-        }
-        Set<String> existing = new LinkedHashSet<>();
-        for (Channel ch : getThing().getChannels()) {
-            String id = ch.getUID().getId();
-            if (isDynamicStorageChannel(id)) {
-                existing.add(id);
+    static int[] assignDriveSlots(Map<Integer, @Nullable String> existing, List<String> deviceKeys) {
+        int[] slots = new int[deviceKeys.size()];
+        Set<Integer> assigned = new HashSet<>();
+        for (Integer n : existing.keySet()) {
+            String key = existing.get(n);
+            int i = key != null ? deviceKeys.indexOf(key) : -1;
+            if (i >= 0 && slots[i] == 0) {
+                slots[i] = n;
+                assigned.add(n);
             }
         }
-        if (desired.equals(existing)) {
-            return; // nichts zu tun
-        }
-        logger.info("Storage drive count changed to {} – rebuilding per-drive channels.", count);
-        ThingBuilder builder = editThing();
-        for (Channel ch : getThing().getChannels()) {
-            if (isDynamicStorageChannel(ch.getUID().getId())) {
-                builder.withoutChannel(ch.getUID());
-            }
-        }
-        for (int i = 0; i < count; i++) {
-            JsonObject dev = devices.get(i).getAsJsonObject();
-            String name = dev.has("storageDeviceName") && !dev.get("storageDeviceName").isJsonNull()
-                    ? dev.get("storageDeviceName").getAsString()
-                    : ("Laufwerk " + (i + 1));
+        for (int i = 0; i < slots.length; i++) {
             int n = i + 1;
-            addDriveChannel(builder, XboxBindingConstants.CHANNEL_STORAGE_TOTAL_DRIVE + n,
-                    XboxBindingConstants.CHANNEL_STORAGE_TOTAL, "Number:DataAmount", name + " Total");
-            addDriveChannel(builder, XboxBindingConstants.CHANNEL_STORAGE_FREE_DRIVE + n,
-                    XboxBindingConstants.CHANNEL_STORAGE_FREE, "Number:DataAmount", name + " Free");
-            addDriveChannel(builder, XboxBindingConstants.CHANNEL_STORAGE_USED_DRIVE + n,
-                    XboxBindingConstants.CHANNEL_STORAGE_USED, "Number:Dimensionless", name + " Used");
+            if (slots[i] == 0 && existing.containsKey(n) && existing.get(n) == null && !assigned.contains(n)) {
+                slots[i] = n;
+                assigned.add(n);
+            }
         }
-        updateThing(builder.build());
+        int next = 1;
+        for (int i = 0; i < slots.length; i++) {
+            if (slots[i] == 0) {
+                while (existing.containsKey(next) || assigned.contains(next)) {
+                    next++;
+                }
+                slots[i] = next;
+                assigned.add(next);
+            }
+        }
+        return slots;
     }
 
-    /** Baut einen einzelnen Laufwerks-Channel und haengt ihn an den ThingBuilder. */
+    /** Baut einen einzelnen Laufwerks-Channel (ersetzt einen vorhandenen gleicher UID). */
     private void addDriveChannel(ThingBuilder builder, String channelId, String channelTypeId, String itemType,
-            String label) {
+            String label, String storageDeviceKey) {
         ChannelUID uid = new ChannelUID(getThing().getUID(), channelId);
         ChannelTypeUID typeUID = new ChannelTypeUID(XboxBindingConstants.BINDING_ID, channelTypeId);
-        Channel channel = ChannelBuilder.create(uid, itemType).withType(typeUID).withLabel(label).build();
+        Map<String, String> properties = new HashMap<>();
+        properties.put(XboxBindingConstants.PROPERTY_STORAGE_DEVICE_ID, storageDeviceKey);
+        Channel channel = ChannelBuilder.create(uid, itemType).withType(typeUID).withLabel(label)
+                .withProperties(properties).build();
+        builder.withoutChannel(uid);
         builder.withChannel(channel);
     }
 
+    /** Laufwerksnummer aus einer Channel-ID wie {@code storageTotalDrive2}; -1 wenn keine. */
+    private static int driveNumber(String channelId, String prefix) {
+        if (!channelId.startsWith(prefix)) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(channelId.substring(prefix.length()));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** Stabile Kennung eines Laufwerks: storageDeviceId, sonst (aeltere Contracts) die Position. */
+    private static String storageDeviceKey(JsonObject dev, int index) {
+        String id = jsonString(dev, "storageDeviceId");
+        return id != null && !id.isBlank() ? id : "drive" + (index + 1);
+    }
+
+    static String driveName(JsonObject dev, int n) {
+        String name = jsonString(dev, "storageDeviceName");
+        return name != null && !name.isBlank() ? name : "Drive " + n;
+    }
+
     /** Liest ein numerisches JSON-Feld; probiert mehrere Schluesselnamen, -1 wenn keiner da. */
-    private double readNum(JsonObject obj, String... keys) {
+    private static double readNum(JsonObject obj, String... keys) {
         for (String k : keys) {
-            if (obj.has(k) && !obj.get(k).isJsonNull()) {
+            JsonElement element = obj.get(k);
+            if (element != null && element.isJsonPrimitive()) {
                 try {
-                    return obj.get(k).getAsDouble();
+                    return element.getAsDouble();
                 } catch (NumberFormatException ignored) {
                     // naechsten Schluessel probieren
                 }
@@ -1111,20 +1608,20 @@ public class XboxHandler extends BaseThingHandler {
         return -1;
     }
 
+    // ---- Cloud-Befehle -------------------------------------------------------------------------
+
     /**
      * Sendet einen Power-Befehl (WakeUp/TurnOff) ueber die Cloud-Command-API.
      */
     private void sendCloudPowerCommand(String command) {
-        String liveId = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_LIVE_ID);
-        if (liveId == null || liveId.isBlank()) {
+        String liveId = getLiveId();
+        if (liveId == null) {
             logger.warn("Cannot send '{}': Live ID not known yet (turn console on once so it can be learned).",
                     command);
             return;
         }
-        if (System.currentTimeMillis() > tokenExpiry || xstsToken == null) {
-            refreshXstsToken();
-        }
-        if (xstsToken == null) {
+        String auth = xblAuthHeader();
+        if (auth == null) {
             logger.warn("Cannot send '{}': no valid Xbox token.", command);
             return;
         }
@@ -1142,7 +1639,8 @@ public class XboxHandler extends BaseThingHandler {
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(XCCS_URL + "/commands"))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + xstsToken)
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "4")
                     .header("skillplatform", "RemoteManagement")
                     .header("Content-Type", "application/json")
@@ -1154,12 +1652,19 @@ public class XboxHandler extends BaseThingHandler {
             if (resp.statusCode() / 100 == 2) {
                 logger.info("Xbox cloud command '{}' accepted.", command);
             } else {
+                if (resp.statusCode() == 401) {
+                    handleUnauthorized("Xbox cloud command");
+                }
                 logger.warn("Xbox cloud command '{}' failed (HTTP {}): {}", command, resp.statusCode(), resp.body());
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (Exception e) {
             logger.error("Error sending cloud power command '{}': {}", command, e.getMessage());
         }
     }
+
+    // ---- Cover-Art -----------------------------------------------------------------------------
 
     /**
      * Holt das Box-Art-Cover ueber den titlehub-Endpunkt und setzt den coverArt-Channel. Presence
@@ -1167,9 +1672,15 @@ public class XboxHandler extends BaseThingHandler {
      * {@code titlehub.xboxlive.com/users/xuid({xuid})/titles/titleid({titleId})/decoration/detail,image}.
      */
     private void fetchCoverArt(String titleId) {
-        String xid = xuid;
-        String token = xstsToken;
-        if (token == null || xid == null || titleId.isEmpty() || "0".equals(titleId)) {
+        String xid;
+        String auth;
+        synchronized (tokenLock) {
+            xid = xuid;
+            String token = xstsToken;
+            String uhs = userHash;
+            auth = (token != null && uhs != null) ? "XBL3.0 x=" + uhs + ";" + token : null;
+        }
+        if (auth == null || xid == null || titleId.isEmpty() || "0".equals(titleId)) {
             return;
         }
         try {
@@ -1177,73 +1688,150 @@ public class XboxHandler extends BaseThingHandler {
                     + ")/decoration/detail,image";
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(url))
-                    .header("Authorization", "XBL3.0 x=" + userHash + ";" + token)
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
+                    .header("Authorization", auth)
                     .header("x-xbl-contract-version", "2")
                     .header("Accept-Language", "en-US")
                     .GET()
                     .build();
             httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .thenApply(HttpResponse::body)
-                    .thenAccept(this::applyCoverArt);
+                    .thenAccept(response -> {
+                        if (disposed) {
+                            return;
+                        }
+                        String body = response.body();
+                        if (response.statusCode() == 200 && body != null) {
+                            applyCoverArt(titleId, body);
+                        } else if (response.statusCode() == 401) {
+                            handleUnauthorized("Cover art (titlehub)");
+                        } else {
+                            logger.debug("Cover art (titlehub) HTTP {}: {}", response.statusCode(), body);
+                        }
+                    })
+                    .exceptionally(e -> {
+                        logger.debug("Error fetching cover art (titlehub): {}", e.getMessage());
+                        return null;
+                    });
         } catch (Exception e) {
             logger.debug("Error fetching cover art (titlehub): {}", e.getMessage());
         }
     }
 
     /** Liest die Bild-URL aus der titlehub-Antwort (BoxArt/Poster/Tile bzw. displayImage) und laedt sie. */
-    private void applyCoverArt(String body) {
-        try {
-            JsonObject json = JsonParser.parseString(body).getAsJsonObject();
-            if (!json.has("titles") || !json.get("titles").isJsonArray()) {
-                return;
-            }
-            JsonArray titles = json.getAsJsonArray("titles");
-            if (titles.size() == 0) {
-                return;
-            }
-            JsonObject t = titles.get(0).getAsJsonObject();
-            String imgUrl = null;
-            if (t.has("images") && t.get("images").isJsonArray()) {
-                JsonArray images = t.getAsJsonArray("images");
-                for (int i = 0; i < images.size(); i++) {
-                    JsonObject img = images.get(i).getAsJsonObject();
-                    String type = img.has("type") ? img.get("type").getAsString() : "";
-                    if ("BoxArt".equalsIgnoreCase(type) || "Poster".equalsIgnoreCase(type)
-                            || "Tile".equalsIgnoreCase(type)) {
-                        if (img.has("url") && !img.get("url").isJsonNull()) {
-                            imgUrl = img.get("url").getAsString();
-                            break;
-                        }
+    private void applyCoverArt(String titleId, String body) {
+        JsonObject json = parseObject(body);
+        JsonArray titles = json != null ? jsonArray(json, "titles") : null;
+        JsonObject t = titles != null && titles.size() > 0 ? asObject(titles.get(0)) : null;
+        if (t == null) {
+            currentTitleId = titleId; // Titel hat keinen titlehub-Eintrag -> nicht bei jedem Poll erneut fragen
+            return;
+        }
+        String imgUrl = null;
+        JsonArray images = jsonArray(t, "images");
+        if (images != null) {
+            for (JsonElement element : images) {
+                JsonObject img = asObject(element);
+                String type = img != null ? jsonString(img, "type") : null;
+                if ("BoxArt".equalsIgnoreCase(type) || "Poster".equalsIgnoreCase(type)
+                        || "Tile".equalsIgnoreCase(type)) {
+                    imgUrl = img != null ? jsonString(img, "url") : null;
+                    if (imgUrl != null) {
+                        break;
                     }
                 }
             }
-            if (imgUrl == null && t.has("displayImage") && !t.get("displayImage").isJsonNull()) {
-                imgUrl = t.get("displayImage").getAsString();
-            }
-            if (imgUrl != null && !imgUrl.isEmpty()) {
-                downloadAndSetImage(imgUrl);
-            }
-        } catch (Exception e) {
-            logger.debug("Error parsing cover art (titlehub): {}", e.getMessage());
+        }
+        if (imgUrl == null) {
+            imgUrl = jsonString(t, "displayImage");
+        }
+        if (imgUrl != null && !imgUrl.isEmpty()) {
+            downloadAndSetImage(titleId, imgUrl);
+        } else {
+            currentTitleId = titleId; // kein Bild vorhanden -> abgehakt
         }
     }
 
-    private void downloadAndSetImage(String imgUrl) {
-        httpClient.sendAsync(HttpRequest.newBuilder().uri(java.net.URI.create(imgUrl)).GET().build(),
-                HttpResponse.BodyHandlers.ofByteArray())
-                .thenAccept(response -> {
-                    if (response != null && response.statusCode() == 200) {
-                        String contentType = response.headers().firstValue("Content-Type").orElse("image/jpeg");
-                        byte[] body = response.body();
-                        if (body != null && contentType != null) {
-                            RawType rawImage = new RawType(body, contentType);
-                            updateChannel(XboxBindingConstants.CHANNEL_COVER_ART, rawImage);
+    private void downloadAndSetImage(String titleId, String imgUrl) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder().uri(java.net.URI.create(imgUrl))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS)).GET().build();
+            httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
+                    .thenAccept(response -> {
+                        if (disposed) {
+                            return;
                         }
-                    }
-                });
+                        if (response != null && response.statusCode() == 200) {
+                            String contentType = response.headers().firstValue("Content-Type").orElse("image/jpeg");
+                            byte[] body = response.body();
+                            if (body != null && contentType != null) {
+                                RawType rawImage = new RawType(body, contentType);
+                                updateChannel(XboxBindingConstants.CHANNEL_COVER_ART, rawImage);
+                                currentTitleId = titleId;
+                            }
+                        } else if (response != null) {
+                            logger.debug("Cover image download HTTP {} for {}", response.statusCode(), imgUrl);
+                        }
+                    })
+                    .exceptionally(e -> {
+                        logger.debug("Error downloading cover image {}: {}", imgUrl, e.getMessage());
+                        return null;
+                    });
+        } catch (IllegalArgumentException e) {
+            logger.debug("Invalid cover image URL '{}': {}", imgUrl, e.getMessage());
+        }
     }
 
-    private synchronized void refreshXstsToken() {
+    // ---- Token-Kette (MSA -> XBL-User -> XSTS) -------------------------------------------------
+
+    /**
+     * Liefert den vollstaendigen {@code XBL3.0}-Authorization-Header aus einem gueltigen Token
+     * (erneuert bei Bedarf). Wer auf {@code tokenLock} gewartet hat, prueft erneut und nutzt den
+     * Token seines Vorgaengers, statt die Login-Kette zu wiederholen. Nach einem Fehlschlag gilt
+     * ein Backoff ({@link #TOKEN_RETRY_MS}). Liest {@code userHash} und {@code xstsToken} atomar.
+     *
+     * @return {@code "XBL3.0 x=<uhs>;<token>"} oder {@code null}, wenn kein gueltiger Token vorliegt
+     */
+    private @Nullable String xblAuthHeader() {
+        synchronized (tokenLock) {
+            long now = System.currentTimeMillis();
+            if (xstsToken != null && userHash != null && now < tokenExpiry) {
+                return "XBL3.0 x=" + userHash + ";" + xstsToken;
+            }
+            if (now >= tokenRetryAfter) {
+                refreshXstsToken();
+            }
+            String token = xstsToken;
+            String uhs = userHash;
+            return (token != null && uhs != null && System.currentTimeMillis() < tokenExpiry)
+                    ? "XBL3.0 x=" + uhs + ";" + token
+                    : null;
+        }
+    }
+
+    /**
+     * Behandelt HTTP 401 eines Xbox-Live-Endpunkts: Token verwerfen. War der Token schon aelter
+     * als {@link #TOKEN_RETRY_MS}, wird zeitnah ein Poll zur Erneuerung geplant; bei einem ganz
+     * frischen Token kein Sofort-Retry (Schutz vor einer 401-Endlosschleife).
+     */
+    private void handleUnauthorized(String context) {
+        boolean retrySoon;
+        synchronized (tokenLock) {
+            retrySoon = xstsToken != null && (System.currentTimeMillis() - tokenObtainedAt) >= TOKEN_RETRY_MS;
+            xstsToken = null;
+            tokenExpiry = 0;
+        }
+        logger.debug("{} returned HTTP 401 – Xbox token invalidated{}", context,
+                retrySoon ? ", scheduling renewal" : "");
+        if (retrySoon) {
+            requestPoll(1000);
+        }
+    }
+
+    /** Fuehrt die Login-Kette aus. Nur ueber {@link #xblAuthHeader()} aufrufen (haelt tokenLock). */
+    private void refreshXstsToken() {
+        if (disposed) {
+            return;
+        }
         String refreshToken = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_REFRESH_TOKEN);
         if (refreshToken == null || refreshToken.isEmpty()) {
             return;
@@ -1254,6 +1842,7 @@ public class XboxHandler extends BaseThingHandler {
             String clientId = resolveClientId();
             HttpRequest oauthReq = HttpRequest.newBuilder()
                     .uri(java.net.URI.create(LIVE_TOKEN_URL))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .POST(BodyPublishers.ofString("grant_type=refresh_token&client_id=" + enc(clientId)
                             + "&scope=" + enc(SCOPE) + "&refresh_token=" + enc(refreshToken)))
@@ -1261,8 +1850,33 @@ public class XboxHandler extends BaseThingHandler {
 
             @SuppressWarnings("null")
             HttpResponse<String> oauthRes = httpClient.send(oauthReq, HttpResponse.BodyHandlers.ofString());
-            JsonObject oauthJson = JsonParser.parseString(oauthRes.body()).getAsJsonObject();
-            String accessToken = oauthJson.get("access_token").getAsString();
+            if (disposed) {
+                return;
+            }
+            JsonObject oauthJson = parseObject(oauthRes.body());
+            String accessToken = oauthJson != null ? jsonString(oauthJson, "access_token") : null;
+            if (oauthJson == null || accessToken == null) {
+                // Microsofts Fehler (z. B. invalid_grant + Beschreibung) loggen statt einer NPE.
+                String error = oauthJson != null ? jsonString(oauthJson, "error") : null;
+                String description = oauthJson != null ? jsonString(oauthJson, "error_description") : null;
+                logger.warn("Microsoft token refresh failed (HTTP {}): {} {}", oauthRes.statusCode(), error,
+                        description != null ? description : oauthRes.body());
+                if ("invalid_grant".equals(error)) {
+                    refreshTokenRejected(description);
+                } else {
+                    authFailed(ThingStatusDetail.COMMUNICATION_ERROR, "Token refresh failed (HTTP "
+                            + oauthRes.statusCode() + (error != null ? ", " + error : "") + ")");
+                }
+                return;
+            }
+            // Microsoft liefert bei jedem Einloesen einen NEUEN Refresh-Token. Laut RFC 6749 §6 muss
+            // der Client den alten dann ersetzen – sonst laeuft der urspruengliche irgendwann ab und
+            // der Login stirbt still. Eigene updateConfiguration() loest kein Re-Init aus.
+            String rotated = jsonString(oauthJson, "refresh_token");
+            if (rotated != null && !rotated.isBlank() && !rotated.equals(refreshToken)) {
+                modifyConfiguration(config -> config.put(XboxBindingConstants.CONFIG_REFRESH_TOKEN, rotated));
+                logger.debug("Stored rotated Microsoft refresh token");
+            }
 
             // 2. Xbox User Token
             JsonObject userAuthBody = new JsonObject();
@@ -1278,16 +1892,25 @@ public class XboxHandler extends BaseThingHandler {
 
             HttpRequest userReq = HttpRequest.newBuilder()
                     .uri(java.net.URI.create("https://user.auth.xboxlive.com/user/authenticate"))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
                     .header("Content-Type", "application/json")
                     .POST(BodyPublishers.ofString(userAuthBody.toString()))
                     .build();
 
             @SuppressWarnings("null")
             HttpResponse<String> userRes = httpClient.send(userReq, HttpResponse.BodyHandlers.ofString());
-            JsonObject userJson = JsonParser.parseString(userRes.body()).getAsJsonObject();
-            String userToken = userJson.get("Token").getAsString();
-            userHash = userJson.get("DisplayClaims").getAsJsonObject().getAsJsonArray("xui").get(0).getAsJsonObject()
-                    .get("uhs").getAsString();
+            if (disposed) {
+                return;
+            }
+            JsonObject userJson = parseObject(userRes.body());
+            String userToken = userJson != null ? jsonString(userJson, "Token") : null;
+            String uhs = userJson != null ? displayClaim(userJson, "uhs") : null;
+            if (userToken == null || uhs == null) {
+                logger.warn("Xbox user authentication failed (HTTP {}): {}", userRes.statusCode(), userRes.body());
+                authFailed(ThingStatusDetail.COMMUNICATION_ERROR,
+                        "Xbox user authentication failed (HTTP " + userRes.statusCode() + ")");
+                return;
+            }
 
             // 3. XSTS Token
             JsonObject xstsBody = new JsonObject();
@@ -1302,61 +1925,176 @@ public class XboxHandler extends BaseThingHandler {
 
             HttpRequest xstsReq = HttpRequest.newBuilder()
                     .uri(java.net.URI.create("https://xsts.auth.xboxlive.com/xsts/authorize"))
+                    .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
                     .header("Content-Type", "application/json")
                     .POST(BodyPublishers.ofString(xstsBody.toString()))
                     .build();
 
             @SuppressWarnings("null")
             HttpResponse<String> xstsRes = httpClient.send(xstsReq, HttpResponse.BodyHandlers.ofString());
-            JsonObject xstsJson = JsonParser.parseString(xstsRes.body()).getAsJsonObject();
-            if (!xstsJson.has("Token")) {
-                logger.error("XSTS token request failed ({}): {}", xstsRes.statusCode(), xstsRes.body());
+            if (disposed) {
                 return;
             }
-            xstsToken = xstsJson.get("Token").getAsString();
-            // XUID aus den XSTS-DisplayClaims merken (fuer presence/titlehub-Cover). uhs kommt schon
-            // vom User-Token; xid steht erst im XSTS-Token.
-            try {
-                JsonObject xui = xstsJson.getAsJsonObject("DisplayClaims").getAsJsonArray("xui").get(0)
-                        .getAsJsonObject();
-                if (xui.has("xid")) {
-                    xuid = xui.get("xid").getAsString();
-                }
-            } catch (Exception ignored) {
-                // xid ist optional – ohne XUID entfaellt nur der Cover-Art-Abruf
+            JsonObject xstsJson = parseObject(xstsRes.body());
+            String token = xstsJson != null ? jsonString(xstsJson, "Token") : null;
+            if (xstsJson == null || token == null) {
+                // HTTP 401 mit XErr, z. B. 2148916233 = kein Xbox-Profil, 2148916238 = Kinderkonto
+                // ohne Freigabe -> Nutzer muss am Account etwas aendern (CONFIGURATION_ERROR).
+                String xerr = xstsJson != null ? jsonString(xstsJson, "XErr") : null;
+                logger.warn("XSTS token request failed (HTTP {}): {}", xstsRes.statusCode(), xstsRes.body());
+                authFailed(xerr != null ? ThingStatusDetail.CONFIGURATION_ERROR : ThingStatusDetail.COMMUNICATION_ERROR,
+                        "Xbox Live authorization failed (HTTP " + xstsRes.statusCode()
+                                + (xerr != null ? ", XErr " + xerr : "") + ")");
+                return;
             }
-            tokenExpiry = System.currentTimeMillis() + 3600000; // 1 hour buffer
-            logger.debug("XSTS token obtained, userHash={}, xuid={}, presence enabled", userHash, xuid);
-
+            userHash = uhs;
+            xstsToken = token;
+            // XUID aus den XSTS-DisplayClaims merken (fuer presence/titlehub-Cover). uhs kommt schon
+            // vom User-Token; xid steht erst im XSTS-Token. Ohne XUID entfaellt nur das Cover.
+            String xid = displayClaim(xstsJson, "xid");
+            if (xid != null) {
+                xuid = xid;
+            }
+            tokenObtainedAt = System.currentTimeMillis();
+            tokenExpiry = tokenRefreshDeadline(jsonString(xstsJson, "NotAfter"));
+            tokenRetryAfter = 0;
+            logger.debug("XSTS token obtained, userHash={}, xuid={}, renew at {}", userHash, xuid,
+                    Instant.ofEpochMilli(tokenExpiry));
+            if (getThing().getStatus() != ThingStatus.ONLINE) {
+                updateStatus(ThingStatus.ONLINE);
+            }
+            updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authenticated"));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (Exception e) {
-            logger.error("Failed to refresh XSTS token: {}", e.getMessage());
+            logger.warn("Failed to refresh XSTS token: {}", e.getMessage());
+            authFailed(ThingStatusDetail.COMMUNICATION_ERROR, "Cannot reach Xbox Live: " + e.getMessage());
         }
     }
 
+    /**
+     * Token-Refresh fehlgeschlagen: Backoff setzen und den Grund am Thing anzeigen. Bei
+     * Kommunikationsfehlern einen Wiederholungs-Poll einplanen, damit das Thing nach einem
+     * Netzausfall nicht erst beim naechsten Poll-Intervall (Default 600 s) wieder ONLINE geht.
+     */
+    private void authFailed(ThingStatusDetail detail, String message) {
+        tokenRetryAfter = System.currentTimeMillis() + TOKEN_RETRY_MS;
+        if (disposed) {
+            return;
+        }
+        updateStatus(ThingStatus.OFFLINE, detail, message);
+        updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType(message));
+        if (detail == ThingStatusDetail.COMMUNICATION_ERROR) {
+            // +1 s Puffer: Scheduler nutzt nanoTime, tokenRetryAfter currentTimeMillis – sonst
+            // koennte der Retry-Poll 1 ms zu frueh laufen und am Backoff abprallen.
+            requestPoll(TOKEN_RETRY_MS + 1000);
+        }
+    }
+
+    /**
+     * Microsoft lehnt den gespeicherten Refresh-Token ab (invalid_grant: abgelaufen, widerrufen,
+     * Passwort geaendert). Er ist endgueltig unbrauchbar -> verwerfen und automatisch einen neuen
+     * QR-Login starten, statt das Thing still mit totem Token weiterlaufen zu lassen.
+     */
+    private void refreshTokenRejected(@Nullable String description) {
+        logger.warn("Microsoft rejected the stored refresh token ({}) – starting a new sign-in.", description);
+        xstsToken = null;
+        tokenExpiry = 0;
+        tokenObtainedAt = 0;
+        if (disposed) {
+            return;
+        }
+        modifyConfiguration(config -> config.put(XboxBindingConstants.CONFIG_REFRESH_TOKEN, ""));
+        updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING,
+                "Sign-in expired – scan the new QR code");
+        updateChannel(XboxBindingConstants.CHANNEL_STATUS, new StringType("Authentication required"));
+        initiateAuthentication();
+    }
+
+    /** Liest {@code DisplayClaims.xui[0].<key>} (uhs bzw. xid) aus einer XBL-Token-Antwort. */
+    private static @Nullable String displayClaim(JsonObject tokenResponse, String key) {
+        JsonObject claims = asObject(tokenResponse.get("DisplayClaims"));
+        JsonArray xui = claims != null ? jsonArray(claims, "xui") : null;
+        JsonObject first = xui != null && xui.size() > 0 ? asObject(xui.get(0)) : null;
+        return first != null ? jsonString(first, key) : null;
+    }
+
+    /** Zeitpunkt fuer den naechsten Refresh: kurz vor NotAfter des XSTS-Tokens, sonst in 1 h. */
+    static long tokenRefreshDeadline(@Nullable String notAfter) {
+        long now = System.currentTimeMillis();
+        if (notAfter != null) {
+            try {
+                long expiresAt = Instant.parse(notAfter).toEpochMilli();
+                return Math.max(now + TOKEN_RETRY_MS, expiresAt - TOKEN_REFRESH_MARGIN_MS);
+            } catch (DateTimeParseException e) {
+                // Fallback unten
+            }
+        }
+        return now + TOKEN_FALLBACK_LIFETIME_MS;
+    }
+
+    // ---- Lokales SmartGlass (UDP 5050) ---------------------------------------------------------
+
     private boolean isAlive() {
+        String host = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_HOST);
+        boolean broadcast = host == null || host.isBlank();
+        InetAddress address = getConsoleAddress();
+        if (address == null) {
+            return false;
+        }
         try (DatagramSocket socket = new DatagramSocket()) {
-            socket.setSoTimeout(2000);
             socket.setBroadcast(true);
-            InetAddress address = getConsoleAddress();
             byte[] discovery = XboxBindingConstants.discoveryPacket();
             socket.send(new DatagramPacket(discovery, discovery.length, address, 5050));
 
             // Auf eine gueltige Discovery-Antwort (0xDD 0x01) warten. Fremde/eigene Broadcast-
             // Pakete werden ignoriert. Aus der Antwort wird – falls noch nicht bekannt – die
-            // Live ID nachgezogen (steckt im Zertifikat der Antwort).
+            // Live ID nachgezogen (steckt im Zertifikat der Antwort). Beim Broadcast (kein host)
+            // kann JEDE Konsole im Netz antworten: dann nur lernen, wenn genau eine geantwortet hat.
             long deadline = System.currentTimeMillis() + 2000;
             byte[] buf = new byte[2048];
-            while (System.currentTimeMillis() < deadline) {
+            String firstIp = null;
+            byte[] firstReply = null;
+            boolean severalConsoles = false;
+            while (!severalConsoles) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
+                socket.setSoTimeout((int) remaining);
                 DatagramPacket resp = new DatagramPacket(buf, buf.length);
-                socket.receive(resp);
+                try {
+                    socket.receive(resp);
+                } catch (SocketTimeoutException e) {
+                    break;
+                }
                 byte[] d = resp.getData();
-                if (resp.getLength() < 2 || d[0] != (byte) 0xDD || d[1] != (byte) 0x01) {
+                int len = resp.getLength();
+                if (len < 2 || d[0] != (byte) 0xDD || d[1] != (byte) 0x01) {
                     continue;
                 }
-                ensureLiveId(d, resp.getLength());
-                return true;
+                if (!broadcast) {
+                    ensureLiveId(d, len);
+                    return true;
+                }
+                String ip = resp.getAddress().getHostAddress();
+                if (firstIp == null) {
+                    firstIp = ip;
+                    firstReply = new byte[len];
+                    System.arraycopy(d, 0, firstReply, 0, len);
+                } else if (!firstIp.equals(ip)) {
+                    severalConsoles = true;
+                }
             }
-            return false;
+            if (firstReply == null) {
+                return false;
+            }
+            if (severalConsoles) {
+                logger.debug("Several consoles answered the broadcast probe – not learning a Live ID (set 'host').");
+            } else {
+                ensureLiveId(firstReply, firstReply.length);
+            }
+            return true;
         } catch (IOException e) {
             return false;
         }
@@ -1364,20 +2102,16 @@ public class XboxHandler extends BaseThingHandler {
 
     /**
      * Zieht die Live ID aus einer Discovery-Antwort (Zertifikat) nach und speichert sie in die
-     * Konfiguration, falls noch keine gesetzt ist. So lernt das Binding die fuer das Power-On
+     * Konfiguration, falls noch keine bekannt ist. So lernt das Binding die fuer das Power-On
      * benoetigte Live ID automatisch, sobald die Konsole einmal eingeschaltet war.
      */
     private void ensureLiveId(byte[] data, int len) {
-        String current = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_LIVE_ID);
-        if (current != null && !current.isBlank()) {
+        if (getLiveId() != null) {
             return;
         }
         String liveId = LiveIdUtil.parseLiveId(data, len);
         if (liveId != null && !liveId.isBlank()) {
-            Configuration config = editConfiguration();
-            config.put(XboxBindingConstants.CONFIG_LIVE_ID, liveId);
-            updateConfiguration(config);
-            logger.info("Auto-filled Xbox Live ID from certificate: {}", liveId);
+            storeLiveId(liveId, "the console's discovery certificate");
         }
     }
 
@@ -1385,69 +2119,80 @@ public class XboxHandler extends BaseThingHandler {
      * Loest die konfigurierte Host-Adresse der Konsole auf. Faellt auf den Broadcast
      * 255.255.255.255 zurueck, wenn kein Host gesetzt ist oder die Aufloesung scheitert.
      */
-    private InetAddress getConsoleAddress() {
+    private @Nullable InetAddress getConsoleAddress() {
         String host = (String) getThing().getConfiguration().get(XboxBindingConstants.CONFIG_HOST);
         try {
-            if (host != null && !host.isEmpty()) {
-                return InetAddress.getByName(host);
-            }
-            return InetAddress.getByName("255.255.255.255");
+            return InetAddress.getByName(host != null && !host.isBlank() ? host.trim() : "255.255.255.255");
         } catch (IOException e) {
             logger.warn("Could not resolve host '{}', falling back to broadcast: {}", host, e.getMessage());
             try {
                 return InetAddress.getByName("255.255.255.255");
             } catch (IOException e2) {
-                return InetAddress.getLoopbackAddress();
+                return null;
             }
         }
     }
 
     /**
-     * Sendet das SmartGlass Power-On-Paket (Typ 0xDD02) mit der Live ID. Eine schlafende Xbox
-     * (Instant-On) wacht nur durch dieses Paket auf, nicht durch ein klassisches WoL-Magic-Packet.
-     * Das Paket geht mehrfach an die Konsolen-Adresse UND an den Broadcast.
+     * Sendet das SmartGlass Power-On-Paket (Typ 0xDD02, s. {@link XboxBindingConstants#powerOnPacket})
+     * mit der Live ID. Eine schlafende Xbox (Instant-On) wacht nur durch dieses Paket auf, nicht durch
+     * ein klassisches WoL-Magic-Packet. Das Paket geht mehrfach an die Konsolen-Adresse UND an den
+     * Broadcast – zeitversetzt eingeplant, damit handleCommand sofort zurueckkehrt.
      */
     private void triggerXboxPowerOn(String liveId) {
         logger.info("Triggering Xbox Power On for Live ID {}", liveId);
-        try {
-            byte[] idBytes = liveId.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-            // Payload = SGString(liveId): uint16-Laenge (big-endian) + ASCII-Bytes. KEIN
-            // Null-Terminator! (Frueher wurde faelschlich ein 0x00 angehaengt und in die
-            // Laenge gezaehlt -> Payload 19 statt 18 Byte; strenge Firmware verwarf das Paket,
-            // die Konsole wachte nicht auf.) Entspricht jetzt xbox-smartglass-core.
-            byte[] payload = new byte[2 + idBytes.length];
-            payload[0] = (byte) ((idBytes.length >> 8) & 0xFF);
-            payload[1] = (byte) (idBytes.length & 0xFF);
-            System.arraycopy(idBytes, 0, payload, 2, idBytes.length);
-            // Header: DD 02 | payloadLen (uint16) | Version (uint16 = 0).
-            byte[] packet = new byte[6 + payload.length];
-            packet[0] = (byte) 0xDD;
-            packet[1] = 0x02;
-            packet[2] = (byte) ((payload.length >> 8) & 0xFF);
-            packet[3] = (byte) (payload.length & 0xFF);
-            packet[4] = 0;
-            packet[5] = 0;
-            System.arraycopy(payload, 0, packet, 6, payload.length);
-
-            InetAddress consoleAddr = getConsoleAddress();
-            InetAddress broadcast = InetAddress.getByName("255.255.255.255");
-            try (DatagramSocket socket = new DatagramSocket()) {
-                socket.setBroadcast(true);
-                for (int i = 0; i < 5; i++) {
-                    socket.send(new DatagramPacket(packet, packet.length, consoleAddr, 5050));
-                    socket.send(new DatagramPacket(packet, packet.length, broadcast, 5050));
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-                logger.info("Xbox Power On packets sent (LiveID {})", liveId);
-            }
-        } catch (IOException e) {
-            logger.error("Error sending Xbox Power On packet: {}", e.getMessage());
+        byte[] packet = XboxBindingConstants.powerOnPacket(liveId);
+        for (int i = 0; i < POWER_ON_REPEATS; i++) {
+            scheduler.schedule(() -> sendPowerOnPacket(packet), i * POWER_ON_REPEAT_MS, TimeUnit.MILLISECONDS);
         }
     }
 
+    private void sendPowerOnPacket(byte[] packet) {
+        if (disposed) {
+            return;
+        }
+        InetAddress consoleAddr = getConsoleAddress();
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setBroadcast(true);
+            InetAddress broadcast = InetAddress.getByName("255.255.255.255");
+            if (consoleAddr != null && !consoleAddr.equals(broadcast)) {
+                socket.send(new DatagramPacket(packet, packet.length, consoleAddr, 5050));
+            }
+            socket.send(new DatagramPacket(packet, packet.length, broadcast, 5050));
+            logger.debug("Xbox Power On packet sent ({} bytes)", packet.length);
+        } catch (IOException e) {
+            logger.warn("Error sending Xbox Power On packet: {}", e.getMessage());
+        }
+    }
+
+    // ---- JSON-Helfer: Gson ist nicht null-annotiert; fehlende/JSON-null-Felder werden zu null --
+
+    /** Parst einen JSON-Body zu einem Objekt; null bei leerem/ungueltigem Body oder Nicht-Objekt. */
+    private static @Nullable JsonObject parseObject(@Nullable String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        try {
+            return asObject(JsonParser.parseString(body));
+        } catch (JsonParseException e) {
+            return null;
+        }
+    }
+
+    /** Liefert das Element als Objekt; null wenn es keines ist. */
+    private static @Nullable JsonObject asObject(@Nullable JsonElement element) {
+        return element != null && element.isJsonObject() ? element.getAsJsonObject() : null;
+    }
+
+    /** Liest ein Feld als String (auch Zahlen/Booleans); null wenn es fehlt oder kein Wert ist. */
+    private static @Nullable String jsonString(JsonObject obj, String key) {
+        JsonElement element = obj.get(key);
+        return element != null && element.isJsonPrimitive() ? element.getAsString() : null;
+    }
+
+    /** Liest ein Array-Feld; null wenn es fehlt oder kein Array ist. */
+    private static @Nullable JsonArray jsonArray(JsonObject obj, String key) {
+        JsonElement element = obj.get(key);
+        return element != null && element.isJsonArray() ? element.getAsJsonArray() : null;
+    }
 }

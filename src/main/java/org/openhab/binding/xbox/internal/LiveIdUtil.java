@@ -16,7 +16,7 @@ import org.eclipse.jdt.annotation.Nullable;
  *
  * Reference: https://openxbox.org/smartglass-documentation/simple_message/
  *
- * @author Jochen
+ * @author t09
  */
 @NonNullByDefault
 public final class LiveIdUtil {

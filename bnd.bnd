@@ -1,0 +1,18 @@
+# bnd configuration for Xbox Binding
+
+# Exclude leeres OH-INF/binding/ (altes openHAB-3-Format, nicht mehr benötigt).
+# Das leere Verzeichnis würde einen bnd-Fehler "Illegal char <<EMPTY>>" verursachen.
+-excluderesource: OH-INF/binding/
+
+# Make java.net.http optional so the bundle resolves on all Karaf versions.
+#
+# Laufzeit-Kompatibilitaet: openHAB 5.x UND 6.x ([5.0,7)). bnd wuerde sonst aus den Compile-JARs
+# [5.0,6) ableiten. ACHTUNG: openHAB 6 gibt es noch nicht (Stand 2026-10) – aendert es eine genutzte
+# API, laedt das Bundle trotzdem und scheitert erst zur Laufzeit; dann gegen OH 6 neu bauen.
+# gson: genutzt werden nur APIs ab 2.8.6 (JsonParser.parseString) -> nicht an die Compile-Version
+# 2.13 binden, sonst liesse sich das Bundle auf einem openHAB mit aelterem gson nicht aufloesen.
+Import-Package: \
+    java.net.http;resolution:=optional, \
+    com.google.gson;version="[2.8,3)", \
+    org.openhab.core.*;version="[5.0,7)", \
+    *

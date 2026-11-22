@@ -6,7 +6,7 @@
 
   <groupId>org.openhab.binding</groupId>
   <artifactId>org.openhab.binding.xbox</artifactId>
-  <version>5.1.4-SNAPSHOT</version>
+  <version>5.2.5-SNAPSHOT</version>
 
   <name>openHAB Add-ons :: Bundles :: Xbox Binding</name>
 
@@ -15,7 +15,10 @@
     <maven.compiler.source>21</maven.compiler.source>
     <maven.compiler.target>21</maven.compiler.target>
     <maven.compiler.release>21</maven.compiler.release>
-    <ohc.version>5.1.4</ohc.version>
+    <!-- API-Basis = kleinste unterstuetzte openHAB-Version: der Compiler stellt so sicher, dass nur
+         APIs genutzt werden, die es schon in 5.0.0 gibt. Die erlaubten Laufzeit-Versionen (5.x und 6.x)
+         stehen in bnd.bnd (Import-Package). -->
+    <ohc.version>5.0.0</ohc.version>
   </properties>
 
   <repositories>
@@ -98,6 +101,13 @@
       <version>2.13.1</version>
       <scope>compile</scope>
     </dependency>
+    <!-- Unit-Tests (src/test/java): Paketformat, Live-ID-Parser, Laufwerksnummern, App-Liste -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.1</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -112,6 +122,11 @@
                einer transitiven Abhängigkeit würde sonst eine Java-7-Warnung erzeugen. -->
           <proc>none</proc>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
